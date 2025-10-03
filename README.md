@@ -1,2 +1,2 @@
 # eth-capstone-treewater-deficit
-predicting tree water deificit
+predicting tree water deficit
