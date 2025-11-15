@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "treewater"
+version = "0.0.0"
+description = "Utilities for ETH capstone tree water deficit project"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.urls]
+"homepage" = ""
