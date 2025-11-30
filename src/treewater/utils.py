@@ -450,7 +450,7 @@ def compute_recursive_predictions_fast(
 
                 # one predict call for all windows at this step
                 if tensor:
-                    y_batch = model.predict(X_batch, batch_size=batch_size).reshape(-1)
+                    y_batch = model.predict(X_batch, batch_size=batch_size,  verbose=0).reshape(-1)
                 else: 
                     y_batch = model.predict(X_batch).reshape(-1)
 
@@ -540,7 +540,8 @@ def compute_recursive_predictions_fast_LSTM(
                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
 
                 # predict in batch using LSTM model inputs
-                y_batch = model.predict([tv_block, other_feats, static_feats], batch_size=batch_size).reshape(-1)
+                y_batch = model.predict([tv_block, other_feats, static_feats], batch_size=batch_size,
+                                         verbose=0).reshape(-1)
 
                 # label indices
                 label_start = step + feature_window_size + shift - 1
