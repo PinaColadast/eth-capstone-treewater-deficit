@@ -563,7 +563,6 @@ def compute_recursive_predictions_fast_LSTM(
     return preds, trues
 
 
-
 def standardize_dataset(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -603,3 +602,137 @@ def standardize_dataset(
     }
     
     return train_df, val_df, test_df
+
+
+def build_autoregressive_training_data_fast_LSTM(
+    model,
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    config: Optional[FeatureConfig] = None,
+    batch_size: int = 64,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build training data where the *history* has been partially replaced by the
+    model's own predictions (offline autoregressive training).
+
+    For each (site, species), we:
+      - build sliding windows of length 2*feature_window_size + 1
+      - run recursive prediction across step = 0..feature_window_size
+      - at *each* step we extract a training sample:
+          X_dyn:  (n_windows, feature_window_size, n_tvt)
+          X_day:  (n_windows, n_other)
+          X_stat: (n_windows, n_static)
+          y_true: (n_windows,) true label returned
+        where the dynamic history includes predictions from previous steps.
+    """
+    config = config or FeatureConfig()
+
+    per_row_cols = config.time_varying + config.time_varying_no_target + config.static
+    n_tvt = len(config.time_varying)
+    n_other = len(config.time_varying_no_target)
+    n_static = len(config.static)
+
+    idx_twd_in_tvt = config.time_varying.index("twd")
+
+    X_dyn_list = []
+    X_day_list = []
+    X_static_list = []
+    y_list = []
+
+    for site in df.site_name.unique():
+        df_site = df.loc[df["site_name"] == site, :]
+        for sp in df_site["species"].unique():
+            df_group = (
+                df_site[df_site["species"] == sp]
+                .sort_values("ts", ascending=True)
+                .reset_index(drop=True)
+            )
+            n_sample = len(df_group)
+            window_len = 2 * feature_window_size + 1
+            n_windows = n_sample - 2 * feature_window_size - label_window_size - shift + 1
+            if n_windows <= 0:
+                continue
+
+            # (n_sample, cols)
+            arr = df_group[per_row_cols].to_numpy(dtype=float)
+
+            # (n_windows, window_len, cols)
+            windows = np.stack(
+                [arr[i : i + window_len] for i in range(n_windows)],
+                axis=0,
+            )
+
+            # column indices inside per-row block
+            idx_tvd = list(range(0, n_tvt))
+            idx_other = list(range(n_tvt, n_tvt + n_other))
+            idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+            # recursive steps: update windows in-place with predictions
+            for step in range(0, feature_window_size + 1):
+                start = step
+                end = start + feature_window_size  # history indices [start:end), current day = end
+
+                # dynamic history (n_windows, feature_window_size, n_tvt)
+                tv_block = windows[:, start:end, :][:, :, idx_tvd]
+
+                # current-day exog + static at index 'end'
+                other_feats = (
+                    windows[:, end, :][:, idx_other]
+                    if n_other > 0
+                    else np.empty((n_windows, 0))
+                )
+                static_feats = (
+                    windows[:, end, :][:, idx_static]
+                    if n_static > 0
+                    else np.empty((n_windows, 0))
+                )
+
+                # label indices inside window
+                label_start = step + feature_window_size + shift - 1
+                label_end = label_start + label_window_size
+                if label_start < 0 or label_end > window_len:
+                    # safety guard for weird shift/label_window combos
+                    continue
+
+                # true labels for this step (read BEFORE overwriting)
+                true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1)
+
+
+
+                if step == feature_window_size:
+                    X_dyn_list.append(tv_block)
+                    X_day_list.append(other_feats)
+                    X_static_list.append(static_feats)
+                    y_list.append(true_labels)
+
+                # if this isn't the last step, do AR update for the *next* step
+                if step < feature_window_size:
+                    y_batch = model.predict(
+                        [tv_block, other_feats, static_feats],
+                        batch_size=batch_size,
+                        verbose=0,
+                    ).reshape(-1)
+
+                    # overwrite twd with predictions
+                    windows[:, label_start, idx_twd_in_tvt] = y_batch
+
+                
+
+
+    if not X_dyn_list:
+        return (
+            np.empty((0, feature_window_size, n_tvt)),
+            np.empty((0, n_other)),
+            np.empty((0, n_static)),
+            np.empty((0,)),
+        )
+
+    X_dyn_ar = np.concatenate(X_dyn_list, axis=0)
+    X_day_ar = np.concatenate(X_day_list, axis=0)
+    X_static_ar = np.concatenate(X_static_list, axis=0)
+    y_ar = np.concatenate(y_list, axis=0)
+    
+
+    return X_dyn_ar, X_day_ar, X_static_ar, y_ar
