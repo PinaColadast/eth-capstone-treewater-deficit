@@ -5,6 +5,7 @@ from typing import Tuple, List, Optional, Union
 from dataclasses import dataclass, field
 from functools import lru_cache
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, root_mean_squared_error
 
 
 @dataclass
@@ -707,6 +708,7 @@ def build_autoregressive_training_data_fast_LSTM_scheduled(
     batch_size: int = 64,
     teacher_forcing_prob: float = 1.0,  # p: prob of using ground-truth
     rng: Optional[np.random.Generator] = None,
+    rng_seed = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Build training data where the *history* has been partially replaced by
@@ -727,6 +729,9 @@ def build_autoregressive_training_data_fast_LSTM_scheduled(
     config = config or FeatureConfig()
     if rng is None:
         rng = np.random.default_rng()
+
+    if rng_seed is not None:
+        rng = np.random.default_rng(rng_seed)
 
     per_row_cols = config.time_varying + config.time_varying_no_target + config.static
     n_tvt = len(config.time_varying)
@@ -915,3 +920,414 @@ def teacher_forcing_prob(
         t = epoch - decay_start_epoch
         alpha = (p0 - p_min) / decay_epochs
         return p0 - alpha * t
+
+
+def cross_validate_datasets(train_df, n_splits=4, feature_window_size=13, config=None):
+    """Create cross validation datasets for time series data.
+    
+    Args:
+        train_df (pd.DataFrame): The training dataframe containing time series data.
+        n_splits (int): Number of splits for cross-validation.
+    
+    Returns:
+        List of tuples: Each tuple contains (train_split, val_split) dataframes.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+    TimeSeriesSplitCls = TimeSeriesSplit
+
+    sites = train_df['site_name'].unique()
+    train_val_datasets = []
+    # collect raw (unstandardized) per-fold DataFrame pieces
+    train_datasets = {}
+    val_datasets = {}
+
+    for site in sites:
+        df_site = train_df.loc[train_df['site_name'] == site, ]
+        species = df_site['species'].unique()
+
+        for sp in species:
+            df_sp = (
+                df_site.loc[df_site['species'] == sp, ]
+                .sort_values(by='ts', ascending=True)
+                .reset_index(drop=True)
+            )
+
+            m = len(df_sp)
+            if m <= 1:
+                # too small: add group's raw rows to every fold's training (no val rows)
+                for f in range(n_splits):
+                    train_datasets.setdefault(f, []).append(df_sp)
+                continue
+
+            splits_for_group = min(n_splits, max(1, m - 1))
+            tscv_group = TimeSeriesSplitCls(n_splits=splits_for_group)
+
+            for i, (train_index, test_index) in enumerate(tscv_group.split(df_sp)):
+                train_split = df_sp.iloc[train_index]
+
+                # expand validation window backward by feature_window_size to allow window construction
+                val_start = max(0, test_index[0] - feature_window_size)
+                val_end = test_index[-1] + 1  # exclusive stop for iloc slicing
+                val_split = df_sp.iloc[val_start:val_end]
+
+                # append raw splits; standardize once per fold after concatenation
+                train_datasets.setdefault(i, []).append(train_split)
+                val_datasets.setdefault(i, []).append(val_split)
+
+            # if this group produced fewer folds than n_splits, add group's full raw training to remaining folds
+            if splits_for_group < n_splits:
+                for f in range(splits_for_group, n_splits):
+                    train_datasets.setdefault(f, []).append(df_sp)
+
+    # build final per-fold DataFrames and standardize once per fold
+    for f in range(n_splits):
+        if f not in val_datasets or len(val_datasets[f]) == 0:
+            # nothing to validate in this fold -> skip
+            continue
+
+        train_fold_df = pd.concat(train_datasets.get(f, []), ignore_index=True).reset_index(drop=True)
+        val_fold_df = pd.concat(val_datasets[f], ignore_index=True).reset_index(drop=True)
+
+        # standardize concatenated fold-level splits once
+        train_cv_df, val_cv_df, _ = standardize_dataset(train_fold_df, val_fold_df, val_fold_df, config=config)
+        train_val_datasets.append((train_cv_df, val_cv_df))
+    
+
+    return train_val_datasets
+
+
+
+def build_ds_from_get_dataset_LSTM(df_split, feature_window_size, config,
+                                   autoregressive=True, shift=1, batch_size=64):
+    """Build a tf.data.Dataset from the 3-input output of get_dataset_LSTM.
+    Robustly handles outputs that are already tf.Tensors (EagerTensor) or numpy-like.
+    """
+    X_ts, day_feat, static_X, y = get_dataset_LSTM(
+        df_split,
+        feature_window_size=feature_window_size,
+        label_window_size=1,
+        autoregressive=autoregressive,
+        shift=shift,
+        config=config,
+    )
+
+
+    ds = tf.data.Dataset.from_tensor_slices(((X_ts, day_feat, static_X), y))
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+# train model with cv datasets, and calculate average performance
+# create function to streamline cv for other models later
+
+
+
+def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at, lag_n, config, batch_size,
+                          num_epochs=40):
+    maes_cv_at = []
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+    for i, (train_cv_ds_at, val_cv_ds_at) in enumerate(cv_train_val_ds_at):
+        print(f"Training fold {i+1}/{len(cv_train_val_ds_at)}")
+        # implement random seed
+        # re-initialize model weights before training on each fold
+        model_fold_cv = model_fold
+        model_fold_cv.set_weights(model_fold.get_weights())
+        # Train the model
+        history_cv_at = model_fold_cv.fit(
+            train_cv_ds_at,
+            validation_data=val_cv_ds_at,
+            epochs=num_epochs,
+            verbose=1
+        )
+        historys_cv_at.append(history_cv_at)
+        # Evaluate on validation set
+        val_loss_1d_at, val_rmse_1day_at, val_mae_1day_at = model_fold_cv.evaluate(val_cv_ds_at, verbose=0)
+        val_pred_1day_at = model_fold_cv.predict(val_cv_ds_at)
+        val_y_cv_1d_at = []
+        for _, y_batch in val_cv_ds_at:
+            val_y_cv_1d_at.append(y_batch.numpy())
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+
+        val_cv_df_at = train_val_datasets_at[i][1]
+        val_pred_recursive_at, val_true_recursive_at  = compute_recursive_predictions_fast_LSTM(
+            model_fold_cv,
+            val_cv_df_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            shift=1,
+            config=config,
+            batch_size=batch_size)
+        
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_pred_1day_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+        
+        
+        maes_cv_at.append(val_mae_1day_at)
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+    
+    return maes_cv_at, rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+
+def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, batch_size,
+                             num_epochs=40):
+    maes_cv_at = []
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+    for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
+        print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
+        # implement random seed
+        # re-initialize model weights before training on each fold
+        
+        val_cv_ds_at = build_ds_from_get_dataset_LSTM(
+        val_cv_dataset_at,
+        feature_window_size=lag_n,
+        config=config,
+        autoregressive=True,
+        shift=1,
+        batch_size=batch_size,
+    )   
+
+        # build training cv data with autoregressive training
+        X_dyn_ar, X_day_ar, X_static_ar, y_ar = build_autoregressive_training_data_fast_LSTM(
+        model=model_fold,
+        df=train_cv_dataset_at,
+        feature_window_size=lag_n,
+        label_window_size=1,
+        shift=1,
+        config=config,
+        batch_size=64,
+        )
+
+        train_cv_ds_at = tf.data.Dataset.from_tensor_slices(
+            ((X_dyn_ar, X_day_ar, X_static_ar), y_ar)
+        ).batch(64).prefetch(tf.data.AUTOTUNE)
+
+        model_fold_cv = model_fold
+        model_fold_cv.set_weights(model_fold.get_weights())
+        # Train the model
+        history_cv_at = model_fold_cv.fit(
+            train_cv_ds_at,
+            validation_data=val_cv_ds_at,
+            epochs=num_epochs,
+            verbose=1
+        )
+        historys_cv_at.append(history_cv_at)
+        # Evaluate on validation set
+        val_loss_1d_at, val_rmse_1day_at, val_mae_1day_at = model_fold_cv.evaluate(val_cv_ds_at, verbose=0)
+        val_pred_1day_at = model_fold_cv.predict(val_cv_ds_at)
+
+        val_y_cv_1d_at = []
+        for _, y_batch in val_cv_ds_at:
+            val_y_cv_1d_at.append(y_batch.numpy())
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+
+        val_pred_recursive_at, val_true_recursive_at  = compute_recursive_predictions_fast_LSTM(
+            model_fold_cv,
+            val_cv_dataset_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            shift=1,
+            config=config,
+            batch_size=batch_size)
+        
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_pred_1day_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+        
+        
+        maes_cv_at.append(val_mae_1day_at)
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+    
+    return maes_cv_at, rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+
+
+def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, batch_size,
+                             num_epochs=40,
+                             p_min = 0.1, warmup_epochs = 3, frac_decay = 0.8):
+    
+    maes_cv_at = []
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+
+    for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
+        print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
+        # implement random seed
+        # re-initialize model weights before training on each fold
+        
+        val_cv_ds_at = build_ds_from_get_dataset_LSTM(
+        val_cv_dataset_at,
+        feature_window_size=lag_n,
+        config=config,
+        autoregressive=True,
+        shift=1,
+        batch_size=batch_size,
+    )   
+
+
+        model_fold_cv = model_fold
+        model_fold_cv.set_weights(model_fold.get_weights())
+        # Train the model
+        history_cv_at, model_fold_cv = train_LSTM_AR_scheduled(
+            model_at_ar=model_fold_cv,
+            train_df_at=train_cv_dataset_at,
+            val_ds_at=val_cv_ds_at,
+            lag_n=lag_n,
+            config=config,
+            batch_size=batch_size,
+            num_epochs=num_epochs,
+            p_min=p_min,
+            warmup_epochs=warmup_epochs,
+            frac_decay=frac_decay
+        )
+        historys_cv_at.append(history_cv_at)
+        # Evaluate on validation set
+        val_loss_1d_at, val_rmse_1day_at, val_mae_1day_at = model_fold_cv.evaluate(val_cv_ds_at, verbose=0)
+        val_pred_1day_at = model_fold_cv.predict(val_cv_ds_at)
+
+        val_y_cv_1d_at = []
+        for _, y_batch in val_cv_ds_at:
+            val_y_cv_1d_at.append(y_batch.numpy())
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+
+        val_pred_recursive_at, val_true_recursive_at  = compute_recursive_predictions_fast_LSTM(
+            model_fold_cv,
+            val_cv_dataset_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            shift=1,
+            config=config,
+            batch_size=batch_size)
+        
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_pred_1day_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+        
+        
+        maes_cv_at.append(val_mae_1day_at)
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+    
+    return maes_cv_at, rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+def train_LSTM_AR_scheduled(
+    model_at_ar,
+    train_df_at: pd.DataFrame,
+    val_ds_at: tf.data.Dataset,
+    lag_n: int,
+    config: FeatureConfig,
+    batch_size: int = 64,
+    num_epochs: int = 100,
+    p_min = 0.1,
+    warmup_epochs = 3,
+    frac_decay = 0.8,
+):
+    """
+    Train an LSTM model with autoregressive scheduled-sampling.
+    """
+    history_ar_at = {
+        "loss": [],
+        "rmse": [],
+        "val_loss": [],
+        "val_rmse": [],
+        "p_tf": [],
+    }
+    for epoch in range(num_epochs):
+        # train model with teacher forcing for the first epoch 
+        p_tf = teacher_forcing_prob(epoch, num_epochs, p0=1.0, p_min=p_min, warmup_epochs=warmup_epochs, frac_decay=frac_decay)
+        history_ar_at["p_tf"].append(p_tf)
+
+        # rebuild AR / scheduled-sampling training data
+        X_dyn_ar_at, X_day_ar_at, X_static_ar_at, y_ar_at = build_autoregressive_training_data_fast_LSTM_scheduled(
+            model_at_ar,
+            train_df_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            shift=1,
+            config=config,
+            batch_size=batch_size,
+            teacher_forcing_prob=p_tf,
+            rng_seed=42
+        )
+
+        train_ds_at_decay = (
+            tf.data.Dataset.from_tensor_slices(((X_dyn_ar_at, X_day_ar_at, X_static_ar_at), y_ar_at))
+            .shuffle(len(X_dyn_ar_at))
+            .batch(batch_size)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
+        # one epoch of manual training
+        epoch_loss = tf.keras.metrics.Mean()
+        epoch_rmse = tf.keras.metrics.RootMeanSquaredError()
+
+        for (x_dyn, x_day, x_stat), y in train_ds_at_decay:
+            with tf.GradientTape() as tape:
+                preds = model_at_ar([x_dyn, x_day, x_stat], training=True)
+                loss = model_at_ar.compute_loss(x=None, y=y, y_pred=preds, sample_weight=None, training=True)
+
+            grads = tape.gradient(loss, model_at_ar.trainable_variables)
+            model_at_ar.optimizer.apply_gradients(zip(grads, model_at_ar.trainable_variables))      
+            epoch_loss.update_state(loss)
+            epoch_rmse.update_state(y, preds)
+
+        # validation
+        val_loss_metric = tf.keras.metrics.Mean()
+        val_rmse_metric = tf.keras.metrics.RootMeanSquaredError()
+        for (x_dyn_v, x_day_v, x_stat_v), y_v in val_ds_at:
+            preds_v = model_at_ar([x_dyn_v, x_day_v, x_stat_v], training=False)
+            v_loss = model_at_ar.compute_loss(x=None, y=y_v, y_pred=preds_v, sample_weight=None, training=False)
+            val_loss_metric.update_state(v_loss)
+            val_rmse_metric.update_state(y_v, preds_v)
+
+        history_ar_at["loss"].append(epoch_loss.result().numpy())
+        history_ar_at["rmse"].append(epoch_rmse.result().numpy())
+        history_ar_at["val_loss"].append(val_loss_metric.result().numpy())
+        history_ar_at["val_rmse"].append(val_rmse_metric.result().numpy())
+        history_ar_at["p_tf"].append(p_tf)
+
+        print(
+            f"Epoch {epoch+1}/{num_epochs} - "
+            f"loss: {history_ar_at['loss'][-1]:.4f} - rmse: {history_ar_at['rmse'][-1]:.4f} - "
+            f"val_loss: {history_ar_at['val_loss'][-1]:.4f} - val_rmse: {history_ar_at['val_rmse'][-1]:.4f} - "
+            f"p_tf: {p_tf:.3f}"
+        )
+
+    return history_ar_at, model_at_ar
