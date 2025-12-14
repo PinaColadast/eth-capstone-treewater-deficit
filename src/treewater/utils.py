@@ -563,47 +563,6 @@ def compute_recursive_predictions_fast_LSTM(
     return preds, trues
 
 
-def standardize_dataset(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    config: Optional[FeatureConfig] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Standardizes specified columns in train, val, and test DataFrames
-    using StandardScaler from sklearn.
-    
-    Args:
-        train_df: Training DataFrame
-        val_df: Validation DataFrame
-        test_df: Test DataFrame
-        cols_to_normalize: List of column names to standardize
-        
-    Returns:
-        Tuple of standardized (train_df, val_df, test_df) and scaler parameters
-    """
-    # use default config
-    config = FeatureConfig()
-    cols_to_normalize = config.cols_to_normalize
-    scaler = StandardScaler()
-    
-    
-    # Fit and transform the training data
-    train_df[cols_to_normalize] = scaler.fit_transform(train_df[cols_to_normalize])
-    
-    # Transform validation and test data using the same scaler
-    val_df[cols_to_normalize] = scaler.transform(val_df[cols_to_normalize])
-    test_df[cols_to_normalize] = scaler.transform(test_df[cols_to_normalize])
-    
-    # Store scaler parameters for later use if needed
-    scaler_params = {
-        'mean_': scaler.mean_,
-        'scale_': scaler.scale_
-    }
-    
-    return train_df, val_df, test_df
-
-
 def build_autoregressive_training_data_fast_LSTM(
     model,
     df: pd.DataFrame,
@@ -736,3 +695,223 @@ def build_autoregressive_training_data_fast_LSTM(
     
 
     return X_dyn_ar, X_day_ar, X_static_ar, y_ar
+
+
+def build_autoregressive_training_data_fast_LSTM_scheduled(
+    model,
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    config: Optional[FeatureConfig] = None,
+    batch_size: int = 64,
+    teacher_forcing_prob: float = 1.0,  # p: prob of using ground-truth
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build training data where the *history* has been partially replaced by
+    the model's own predictions with scheduled sampling.
+
+    For each (site, species), we:
+      - build sliding windows of length 2*feature_window_size + 1
+      - run recursive prediction across step = 0..feature_window_size
+      - at each step we may overwrite the target with:
+          - ground truth    with prob = teacher_forcing_prob
+          - model prediction with prob = 1 - teacher_forcing_prob
+      - at step == feature_window_size we extract a training sample:
+          X_dyn:  (n_windows, feature_window_size, n_tvt)
+          X_day:  (n_windows, n_other)
+          X_stat: (n_windows, n_static)
+          y_true: (n_windows,) true label
+    """
+    config = config or FeatureConfig()
+    if rng is None:
+        rng = np.random.default_rng()
+
+    per_row_cols = config.time_varying + config.time_varying_no_target + config.static
+    n_tvt = len(config.time_varying)
+    n_other = len(config.time_varying_no_target)
+    n_static = len(config.static)
+
+    idx_twd_in_tvt = config.time_varying.index("twd")
+
+    X_dyn_list = []
+    X_day_list = []
+    X_static_list = []
+    y_list = []
+
+    for site in df.site_name.unique():
+        df_site = df.loc[df["site_name"] == site, :]
+        for sp in df_site["species"].unique():
+            df_group = (
+                df_site[df_site["species"] == sp]
+                .sort_values("ts", ascending=True)
+                .reset_index(drop=True)
+            )
+            n_sample = len(df_group)
+            window_len = 2 * feature_window_size + 1
+            n_windows = n_sample - 2 * feature_window_size - label_window_size - shift + 1
+            if n_windows <= 0:
+                continue
+
+            # (n_sample, cols)
+            arr = df_group[per_row_cols].to_numpy(dtype=float)
+
+            # (n_windows, window_len, cols)
+            windows = np.stack(
+                [arr[i : i + window_len] for i in range(n_windows)],
+                axis=0,
+            )
+
+            # column indices inside per-row block
+            idx_tvd = list(range(0, n_tvt))
+            idx_other = list(range(n_tvt, n_tvt + n_other))
+            idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+            # recursive steps: update windows in-place with predictions or truth
+            for step in range(0, feature_window_size + 1):
+                start = step
+                end = start + feature_window_size  # history indices [start:end), current day = end
+
+                # dynamic history (n_windows, feature_window_size, n_tvt)
+                tv_block = windows[:, start:end, :][:, :, idx_tvd]
+
+                # current-day exog + static at index 'end'
+                other_feats = (
+                    windows[:, end, :][:, idx_other]
+                    if n_other > 0
+                    else np.empty((n_windows, 0))
+                )
+                static_feats = (
+                    windows[:, end, :][:, idx_static]
+                    if n_static > 0
+                    else np.empty((n_windows, 0))
+                )
+
+                # label indices inside window
+                label_start = step + feature_window_size + shift - 1
+                label_end = label_start + label_window_size
+                if label_start < 0 or label_end > window_len:
+                    # safety guard for weird shift/label_window combos
+                    continue
+
+                # true labels for this step (read BEFORE overwriting)
+                true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1)
+
+                # At the last step we collect training samples
+                if step == feature_window_size:
+                    X_dyn_list.append(tv_block)
+                    X_day_list.append(other_feats)
+                    X_static_list.append(static_feats)
+                    y_list.append(true_labels)
+
+                # For the next step, update history with either truth or prediction
+                if step < feature_window_size:
+                    # model prediction for this step
+                    y_pred = model.predict(
+                        [tv_block, other_feats, static_feats],
+                        batch_size=batch_size,
+                        verbose=0,
+                    ).reshape(-1)
+
+                    # scheduled sampling mask: True -> use ground truth, False -> use prediction
+                    # shape: (n_windows,)
+                    use_truth = rng.random(n_windows) < teacher_forcing_prob
+
+                    # combine
+                    # we must not modify true_labels in-place, so create a new array
+                    updated_values = np.where(use_truth, true_labels, y_pred)
+
+                    # overwrite twd with chosen values
+                    windows[:, label_start, idx_twd_in_tvt] = updated_values
+
+    if not X_dyn_list:
+        return (
+            np.empty((0, feature_window_size, n_tvt)),
+            np.empty((0, n_other)),
+            np.empty((0, n_static)),
+            np.empty((0,)),
+        )
+
+    X_dyn_ar = np.concatenate(X_dyn_list, axis=0)
+    X_day_ar = np.concatenate(X_day_list, axis=0)
+    X_static_ar = np.concatenate(X_static_list, axis=0)
+    y_ar = np.concatenate(y_list, axis=0)
+
+    return X_dyn_ar, X_day_ar, X_static_ar, y_ar
+
+
+
+def standardize_dataset(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    config: Optional[FeatureConfig] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Standardizes specified columns in train, val, and test DataFrames
+    using StandardScaler from sklearn.
+    
+    Args:
+        train_df: Training DataFrame
+        val_df: Validation DataFrame
+        test_df: Test DataFrame
+        cols_to_normalize: List of column names to standardize
+        
+    Returns:
+        Tuple of standardized (train_df, val_df, test_df) and scaler parameters
+    """
+    # use default config
+    config = FeatureConfig()
+    cols_to_normalize = config.cols_to_normalize
+    scaler = StandardScaler()
+    
+    
+    # Fit and transform the training data
+    train_df[cols_to_normalize] = scaler.fit_transform(train_df[cols_to_normalize])
+    
+    # Transform validation and test data using the same scaler
+    val_df[cols_to_normalize] = scaler.transform(val_df[cols_to_normalize])
+    test_df[cols_to_normalize] = scaler.transform(test_df[cols_to_normalize])
+    
+    # Store scaler parameters for later use if needed
+    scaler_params = {
+        'mean_': scaler.mean_,
+        'scale_': scaler.scale_
+    }
+    
+    return train_df, val_df, test_df
+
+
+
+
+## some training functions
+def teacher_forcing_prob(
+    epoch: int,
+    num_epochs: int,
+    p0: float = 1.0,
+    p_min: float = 0.2,
+    warmup_epochs: int = 10,
+    frac_decay: float = 0.8,
+):
+    """
+    - p = p0 for epochs [0, warmup_epochs)
+    - then linearly decays to p_min
+    - then stays at p_min
+    """
+    # If we want decay to finish by frac_decay * num_epochs
+    decay_end_epoch = int(frac_decay * num_epochs)
+    decay_start_epoch = warmup_epochs
+    decay_epochs = max(decay_end_epoch - decay_start_epoch, 1)
+
+    if epoch < decay_start_epoch:
+        # warm-up: full teacher forcing
+        return p0
+    elif epoch >= decay_end_epoch:
+        # after decay phase: keep at floor
+        return p_min
+    else:
+        # linear decay between p0 and p_min
+        t = epoch - decay_start_epoch
+        alpha = (p0 - p_min) / decay_epochs
+        return p0 - alpha * t
