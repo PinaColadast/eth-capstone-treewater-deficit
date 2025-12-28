@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from functools import partial
 from typing import Tuple, List, Optional, Union
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -924,7 +925,7 @@ def teacher_forcing_prob(
         return p0 - alpha * t
 
 
-def teacher_forcing_probs_stepwise(
+def teacher_forcing_prob_stepwise(
     epoch: int,
     num_epochs: int,
     epoch_per_step: int = 10,
@@ -954,10 +955,11 @@ def teacher_forcing_probs_stepwise(
         return p_min
     else:
         # linear decay between p0 and p_min
-        t = epoch //epoch_per_step
-
-
-        return p0 - t* step_size
+        num_steps = decay_epochs //epoch_per_step
+        step_size = np.maximum((p0 - p_min) / num_steps, step_size)
+        t = (epoch - decay_start_epoch) // epoch_per_step
+        p_t = np.maximum(p_min, p0 - (t+1)* step_size)
+        return p_t
 
 
 
@@ -1209,7 +1211,8 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
 
 def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, batch_size,
                              num_epochs=40,
-                             p_min = 0.1, warmup_epochs = 3, frac_decay = 0.8):
+                             p_min = 0.1, warmup_epochs = 3, frac_decay = 0.8,
+                             slow_decay = True):
     
     maes_cv_at = []
     rmses_cv_at = []
@@ -1248,7 +1251,8 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
             num_epochs=num_epochs,
             p_min=p_min,
             warmup_epochs=warmup_epochs,
-            frac_decay=frac_decay
+            frac_decay=frac_decay,
+            slow_decay = slow_decay
         )
         historys_cv_at.append(history_cv_at)
         # Evaluate on validation set
@@ -1297,6 +1301,7 @@ def train_LSTM_AR_scheduled(
     p_min = 0.1,
     warmup_epochs = 3,
     frac_decay = 0.8,
+    slow_decay = True
 ):
     """
     Train an LSTM model with autoregressive scheduled-sampling.
@@ -1308,9 +1313,15 @@ def train_LSTM_AR_scheduled(
         "val_rmse": [],
         "p_tf": [],
     }
+
+    if slow_decay:
+        teacher_forcing_prob_fn = partial(teacher_forcing_prob_stepwise, epoch_per_step=5)
+    else:
+        teacher_forcing_prob_fn = teacher_forcing_prob
+        
     for epoch in range(num_epochs):
         # train model with teacher forcing for the first epoch 
-        p_tf = teacher_forcing_prob(epoch, num_epochs, p0=1.0, p_min=p_min, warmup_epochs=warmup_epochs, frac_decay=frac_decay)
+        p_tf = teacher_forcing_prob_fn(epoch, num_epochs, p0=1.0, p_min=p_min, warmup_epochs=warmup_epochs, frac_decay=frac_decay)
         history_ar_at["p_tf"].append(p_tf)
 
         # rebuild AR / scheduled-sampling training data
