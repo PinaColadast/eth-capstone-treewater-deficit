@@ -904,6 +904,8 @@ def teacher_forcing_prob(
     - then linearly decays to p_min
     - then stays at p_min
     """
+
+    # slower decay
     # If we want decay to finish by frac_decay * num_epochs
     decay_end_epoch = int(frac_decay * num_epochs)
     decay_start_epoch = warmup_epochs
@@ -920,6 +922,43 @@ def teacher_forcing_prob(
         t = epoch - decay_start_epoch
         alpha = (p0 - p_min) / decay_epochs
         return p0 - alpha * t
+
+
+def teacher_forcing_probs_stepwise(
+    epoch: int,
+    num_epochs: int,
+    epoch_per_step: int = 10,
+    step_size: float = 0.1,
+    p0: float = 1.0,
+    p_min: float = 0.2,
+    warmup_epochs: int = 3,
+    frac_decay: float = 0.8,
+):
+    """
+    - p = p0 for epochs [0, warmup_epochs)
+    - then linearly decays to p_min
+    - then stays at p_min
+    """
+
+    # slower decay
+    # If we want decay to finish by frac_decay * num_epochs
+    decay_end_epoch = int(frac_decay * num_epochs)
+    decay_start_epoch = warmup_epochs
+    decay_epochs = max(decay_end_epoch - decay_start_epoch, 1)
+
+    if epoch < decay_start_epoch:
+        # warm-up: full teacher forcing
+        return p0
+    elif epoch >= decay_end_epoch:
+        # after decay phase: keep at floor
+        return p_min
+    else:
+        # linear decay between p0 and p_min
+        t = epoch //epoch_per_step
+
+
+        return p0 - t* step_size
+
 
 
 def cross_validate_datasets(train_df, n_splits=4, feature_window_size=13, config=None):
