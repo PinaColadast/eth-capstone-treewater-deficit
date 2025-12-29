@@ -1381,3 +1381,20 @@ def train_LSTM_AR_scheduled(
         )
 
     return history_ar_at, model_at_ar
+
+
+
+
+## processing functions 
+
+def clip_and_inverse_log2_transform(y_pred: np.ndarray) -> np.ndarray:
+    """
+    Clips negative predictions to zero and applies inverse log2 transformation.
+    
+    Args:
+        y_pred: Array of predicted values in log2 scale 
+    
+    Returns:
+        Array of predictions in original scale with negatives clipped to zero
+    """
+    return np.clip(np.power(2, y_pred) - 1, a_min=0, a_max=None)
