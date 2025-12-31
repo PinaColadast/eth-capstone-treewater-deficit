@@ -1,6 +1,5 @@
 name: pyenv
 channels:
-  - defaults
   - conda-forge
 dependencies:
   - absl-py=2.1.0=py311hca03da5_0
