@@ -1073,12 +1073,15 @@ def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at,
     y_preds_cv_at = []
     y_trues_cv_at = []
     historys_cv_at = []
+    init_weights = model_fold.get_weights()
     for i, (train_cv_ds_at, val_cv_ds_at) in enumerate(cv_train_val_ds_at):
         print(f"Training fold {i+1}/{len(cv_train_val_ds_at)}")
         # implement random seed
         # re-initialize model weights before training on each fold
+        tf.keras.backend.clear_session()  # optional but helps in notebooks
+
         model_fold_cv = model_fold
-        model_fold_cv.set_weights(model_fold.get_weights())
+        model_fold_cv.set_weights(init_weights)
         # Train the model
         history_cv_at = model_fold_cv.fit(
             train_cv_ds_at,
