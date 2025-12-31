@@ -140,8 +140,8 @@ dependencies:
   - pure_eval=0.2.3
   - pycparser=2.22
   - pygments=2.19.2
-  - pyobjc-core=12.1
-  - pyobjc-framework-cocoa=12.1
+  # - pyobjc-core=12.1
+  # - pyobjc-framework-cocoa=12.1
   - pyparsing=3.3.1
   - pysocks=1.7.1
   - python=3.12.6
