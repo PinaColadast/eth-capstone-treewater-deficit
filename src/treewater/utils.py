@@ -1136,6 +1136,7 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
     y_preds_cv_at = []
     y_trues_cv_at = []
     historys_cv_at = []
+    nit_weights = model_fold.get_weights()
     for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
         print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
         # implement random seed
@@ -1166,7 +1167,7 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
         ).batch(64).prefetch(tf.data.AUTOTUNE)
 
         model_fold_cv = model_fold
-        model_fold_cv.set_weights(model_fold.get_weights())
+        model_fold_cv.set_weights(init_weights)
         # Train the model
         history_cv_at = model_fold_cv.fit(
             train_cv_ds_at,
@@ -1225,7 +1226,7 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
     y_preds_cv_at = []
     y_trues_cv_at = []
     historys_cv_at = []
-
+    init_weights = model_fold.get_weights()
     for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
         print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
         # implement random seed
@@ -1242,7 +1243,7 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
 
 
         model_fold_cv = model_fold
-        model_fold_cv.set_weights(model_fold.get_weights())
+        model_fold_cv.set_weights(init_weights)
         # Train the model
         history_cv_at, model_fold_cv = train_LSTM_AR_scheduled(
             model_at_ar=model_fold_cv,
