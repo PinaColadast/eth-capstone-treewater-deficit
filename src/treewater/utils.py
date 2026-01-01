@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import torch
 from functools import partial
 from typing import Tuple, List, Optional, Union
 from dataclasses import dataclass, field
@@ -239,6 +240,67 @@ def get_dataset_LSTM(
     labels_tf = tf.convert_to_tensor(labels_arr, dtype=tf.float32)
     
     return tv_block_tf, pred_day_other_feats_tf, static_feats_tf, labels_tf
+
+
+def get_dataset_NN_torch(
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    autoregressive: bool = False,
+    config: Optional[FeatureConfig] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    config = config or FeatureConfig()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tv_block_list = []
+    pred_day_other_feats_list = []
+    static_feats_list = []
+    labels_list = []
+
+    sites = df["site_name"].unique()
+    for site in sites:
+        df_site = df[df["site_name"] == site]
+        species = df_site["species"].unique()
+
+        for sp in species:
+            df_sp = (
+                df_site[df_site["species"] == sp]
+                .sort_values(by="ts", ascending=True)
+                .drop(["species", "site_name", "ts"], axis=1)
+                .reset_index(drop=True)
+            )
+
+            tv_block, pred_day_other_feats, static_feats, labels = get_feature_windows_LSTM(
+                df_sp, feature_window_size, label_window_size, shift, autoregressive, config
+            )
+
+            tv_block_list.append(tv_block)
+            pred_day_other_feats_list.append(pred_day_other_feats)
+            static_feats_list.append(static_feats)
+            labels_list.append(labels)
+
+    if tv_block_list:
+        tv_block_arr = np.concatenate(tv_block_list, axis=0)
+        pred_day_other_feats_arr = np.concatenate(pred_day_other_feats_list, axis=0)
+        static_feats_arr = np.concatenate(static_feats_list, axis=0)
+        labels_arr = np.concatenate(labels_list, axis=0)
+    else:
+        n_tvt = len(config.time_varying) if autoregressive else len(config.time_varying_no_target)
+        n_other = len(config.time_varying_no_target)
+        n_static = len(config.static)
+        tv_block_arr = np.empty((0, feature_window_size, n_tvt), dtype=float)
+        pred_day_other_feats_arr = np.empty((0, n_other), dtype=float)
+        static_feats_arr = np.empty((0, n_static), dtype=float)
+        labels_arr = np.empty((0,), dtype=float)
+
+    # convert to torch tensors and move to device if available
+    tv_block_t = torch.from_numpy(tv_block_arr).float().to(device)
+    pred_day_other_feats_t = torch.from_numpy(pred_day_other_feats_arr).float().to(device)
+    static_feats_t = torch.from_numpy(static_feats_arr).float().to(device)
+    labels_t = torch.from_numpy(labels_arr).float().to(device)
+
+    return tv_block_t, pred_day_other_feats_t, static_feats_t, labels_t
 
 def spliting_windows_df(df: pd.DataFrame, 
                                         feature_window_size: int ,
