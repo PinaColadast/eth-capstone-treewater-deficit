@@ -1136,7 +1136,7 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
     y_preds_cv_at = []
     y_trues_cv_at = []
     historys_cv_at = []
-    nit_weights = model_fold.get_weights()
+    init_weights = model_fold.get_weights()
     for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
         print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
         # implement random seed
