@@ -251,7 +251,7 @@ def get_dataset_NN_torch(
     config: Optional[FeatureConfig] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     config = config or FeatureConfig()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
 
     tv_block_list = []
     pred_day_other_feats_list = []
@@ -295,10 +295,10 @@ def get_dataset_NN_torch(
         labels_arr = np.empty((0,), dtype=float)
 
     # convert to torch tensors and move to device if available
-    tv_block_t = torch.from_numpy(tv_block_arr).float().to(device)
-    pred_day_other_feats_t = torch.from_numpy(pred_day_other_feats_arr).float().to(device)
-    static_feats_t = torch.from_numpy(static_feats_arr).float().to(device)
-    labels_t = torch.from_numpy(labels_arr).float().to(device)
+    tv_block_t = torch.from_numpy(tv_block_arr).float()
+    pred_day_other_feats_t = torch.from_numpy(pred_day_other_feats_arr).float()
+    static_feats_t = torch.from_numpy(static_feats_arr).float()
+    labels_t = torch.from_numpy(labels_arr).float()
 
     return tv_block_t, pred_day_other_feats_t, static_feats_t, labels_t
 
