@@ -603,6 +603,126 @@ def compute_recursive_predictions_fast_LSTM(
                 other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
 
+                # predict in batch using a PyTorch model
+                # tv_block: (n_windows, feature_window_size, n_tvt)
+                # other_feats: (n_windows, n_other)
+                # static_feats: (n_windows, n_static)
+                # We'll run inference in chunks to avoid OOM and support device placement.
+                # Determine device from model params if possible, otherwise use CUDA if available.
+                try:
+                    dev = next(model.parameters()).device
+                except StopIteration:
+                    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+                was_training = model.training
+                model.eval()
+                y_preds_chunks = []
+                with torch.no_grad():
+                    n_all = tv_block.shape[0]
+                    for s in range(0, n_all, batch_size):
+                        e = min(s + batch_size, n_all)
+                        tv_b = torch.from_numpy(tv_block[s:e]).float().to(dev)
+                        other_b = torch.from_numpy(other_feats[s:e]).float().to(dev) if n_other > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
+                        static_b = torch.from_numpy(static_feats[s:e]).float().to(dev) if n_static > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
+                        try:
+                            out = model(tv_b, other_b, static_b)
+                        except TypeError:
+                            out = model([tv_b, other_b, static_b])
+                        out = out.reshape(-1).cpu().numpy()
+                        y_preds_chunks.append(out)
+
+                if was_training:
+                    model.train()
+
+                if len(y_preds_chunks) > 0:
+                    y_batch = np.concatenate(y_preds_chunks, axis=0)
+                else:
+                    y_batch = np.array([])
+
+                # label indices
+                label_start = step + feature_window_size + shift - 1
+                label_end = label_start + label_window_size
+
+                if step == feature_window_size:
+                    true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1)
+                    preds_all.append(y_batch)
+                    trues_all.append(true_labels)
+                else:
+                    # update autoregressive twd in all windows for next step
+                    windows[:, label_start, idx_twd_in_tvt] = y_batch
+
+    if len(preds_all) == 0:
+        return np.array([]), np.array([])
+
+    preds = np.concatenate(preds_all, axis=0)
+    trues = np.concatenate(trues_all, axis=0)
+    return preds, trues
+
+
+def compute_recursive_predictions_fast_torch(
+    model,
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    config: Optional[FeatureConfig] = None,
+    batch_size: int = 64
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized autoregressive recursive predictions for an LSTM model.
+    The model is expected to accept three inputs: 
+      [past_dynamic (N, timesteps, n_tvt), current_day_exog (N, n_other), static (N, n_static)]
+    Returns (preds, trues) as 1D numpy arrays.
+    """
+    config = config or FeatureConfig()
+    preds_all = []
+    trues_all = []
+
+    per_row_cols = config.time_varying + config.time_varying_no_target + config.static
+    n_tvt = len(config.time_varying)
+    n_other = len(config.time_varying_no_target)
+    n_static = len(config.static)
+
+    # index of twd inside the time_varying block
+    idx_twd_in_tvt = config.time_varying.index("twd")
+
+    for site in df.site_name.unique():
+        df_site = df.loc[df['site_name'] == site, :]
+        for sp in df_site['species'].unique():
+            df_group = (
+                df_site[df_site['species'] == sp]
+                .sort_values('ts', ascending=True)
+                .reset_index(drop=True)
+            )
+            n_sample = len(df_group)
+            window_len = 2 * feature_window_size + 1
+            n_windows = n_sample - 2*feature_window_size - label_window_size - shift + 1
+            if n_windows <= 0:
+                continue
+
+            # numpy array (n_sample, cols)
+            arr = df_group[per_row_cols].to_numpy(dtype=float)
+
+            # sliding windows: (n_windows, window_len, cols)
+            windows = np.stack([arr[i : i + window_len] for i in range(n_windows)], axis=0)
+
+            # column indices inside per-row block
+            idx_tvd = list(range(0, n_tvt))
+            idx_other = list(range(n_tvt, n_tvt + n_other))
+            idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+            # recursive steps
+            for step in range(0, feature_window_size + 1):
+                start = step
+                end = start + feature_window_size  # exclusive end for slicing past lags; current index = end
+
+                # keep 3D dynamic block: (n_windows, feature_window_size, n_tvt)
+                tv_block = windows[:, start:end, :][:, :, idx_tvd]
+
+                # current-day non-target and static features (at index 'end')
+                other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
+                static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
+
                 # predict in batch using LSTM model inputs
                 y_batch = model.predict([tv_block, other_feats, static_feats], batch_size=batch_size,
                                          verbose=0).reshape(-1)
