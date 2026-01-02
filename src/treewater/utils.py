@@ -724,9 +724,42 @@ def compute_recursive_predictions_fast_torch(
                 other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
 
-                # predict in batch using LSTM model inputs
-                y_batch = model.predict([tv_block, other_feats, static_feats], batch_size=batch_size,
-                                         verbose=0).reshape(-1)
+                # predict in batch using a PyTorch model
+                # tv_block: (n_windows, feature_window_size, n_tvt)
+                # other_feats: (n_windows, n_other)
+                # static_feats: (n_windows, n_static)
+                # We'll run inference in chunks to avoid OOM and support device placement.
+                # Determine device from model params if possible, otherwise use CUDA if available.
+                try:
+                    dev = next(model.parameters()).device
+                except StopIteration:
+                    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+                was_training = model.training
+                model.eval()
+                y_preds_chunks = []
+                with torch.no_grad():
+                    n_all = tv_block.shape[0]
+                    for s in range(0, n_all, batch_size):
+                        e = min(s + batch_size, n_all)
+                        tv_b = torch.from_numpy(tv_block[s:e]).float().to(dev)
+                        other_b = torch.from_numpy(other_feats[s:e]).float().to(dev) if n_other > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
+                        static_b = torch.from_numpy(static_feats[s:e]).float().to(dev) if n_static > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
+                        try:
+                            out = model(tv_b, other_b, static_b)
+                        except TypeError:
+                            out = model([tv_b, other_b, static_b])
+                        out = out.reshape(-1).cpu().numpy()
+                        y_preds_chunks.append(out)
+
+                if was_training:
+                    model.train()
+
+                if len(y_preds_chunks) > 0:
+                    y_batch = np.concatenate(y_preds_chunks, axis=0)
+                else:
+                    y_batch = np.array([])
+
 
                 # label indices
                 label_start = step + feature_window_size + shift - 1
