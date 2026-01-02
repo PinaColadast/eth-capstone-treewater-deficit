@@ -462,6 +462,7 @@ def compute_recursive_predictions_fast(
     Returns (preds, trues) as 1D numpy arrays (matching original function semantics).
     """
     config = config or FeatureConfig()
+    
     preds_all = []
     trues_all = []
 
