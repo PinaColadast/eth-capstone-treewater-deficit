@@ -723,7 +723,7 @@ def compute_recursive_predictions_fast_torch(
                 other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
 
-                               # predict in batch using a PyTorch model
+                # predict in batch using a PyTorch model
                 # tv_block: (n_windows, feature_window_size, n_tvt)
                 # other_feats: (n_windows, n_other)
                 # static_feats: (n_windows, n_static)
