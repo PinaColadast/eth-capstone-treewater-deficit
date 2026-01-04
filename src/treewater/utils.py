@@ -1527,6 +1527,7 @@ def train_LSTM_AR_scheduled(
     batch_size: int = 64,
     num_epochs: int = 100,
     p_min = 0.1,
+    epoch_per_step = 5,
     warmup_epochs = 3,
     frac_decay = 0.8,
     slow_decay = True
@@ -1543,7 +1544,7 @@ def train_LSTM_AR_scheduled(
     }
 
     if slow_decay:
-        teacher_forcing_prob_fn = partial(teacher_forcing_prob_stepwise, epoch_per_step=5)
+        teacher_forcing_prob_fn = partial(teacher_forcing_prob_stepwise, epoch_per_step=epoch_per_step)
     else:
         teacher_forcing_prob_fn = teacher_forcing_prob
         
@@ -1615,82 +1616,9 @@ def train_LSTM_AR_scheduled(
 
 # example: model_factory = lambda: EncoderOnlyForecast(...).to(device)
 
-def train_one_epoch(model, epoch_index, train_loader, loss_fn, optimizer, device=None, log_every=100):
-    device = device or next(model.parameters()).device
-    running_loss = 0.0
-    sse = 0.0
-    n_samples = 0
-    n_batches = 0
+gi
 
-    model.train()
-    for i, batch in enumerate(train_loader):
-        X_dyn, X_day, X_static, labels = batch
-        X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
 
-        optimizer.zero_grad()
-        outputs = model(X_dyn, X_day, X_static)
-        loss = loss_fn(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += float(loss.item())
-        batch_sse = float(F.mse_loss(outputs, labels, reduction='sum').item())
-        sse += batch_sse
-        n_samples += labels.numel()
-        n_batches += 1
-
-        if (i + 1) % log_every == 0:
-            print(f'  batch {i+1} loss: {running_loss / n_batches:.4f}')
-
-    avg_batch_loss = running_loss / n_batches if n_batches > 0 else float("nan")
-    train_rmse = math.sqrt(sse / n_samples) if n_samples > 0 else float("nan")
-    return avg_batch_loss, train_rmse
-
-def train_transformer(model, train_loader, val_loader, loss_fn, optimizer, n_epochs=50, device=None):
-    device = device or next(model.parameters()).device
-    best_val_rmse = float("inf")
-    best_model_state = None
-    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
-
-    model.to(device)
-    for epoch in range(n_epochs):
-        print(f'Epoch {epoch + 1}/{n_epochs}')
-        train_loss, train_rmse = train_one_epoch(model, epoch, train_loader, loss_fn, optimizer, device=device)
-        print(f'  Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}')
-
-        # validation
-        model.eval()
-        val_sse = 0.0
-        val_batches = 0
-        val_n = 0
-        val_loss_sum = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
-                X_dyn, X_day, X_static, labels = batch
-                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
-                outputs = model(X_dyn, X_day, X_static)
-                vloss = loss_fn(outputs, labels)
-                val_loss_sum += float(vloss.item())
-                val_sse += float(F.mse_loss(outputs, labels, reduction='sum').item())
-                val_n += labels.numel()
-                val_batches += 1
-
-        avg_vloss = val_loss_sum / val_batches if val_batches > 0 else float("nan")
-        val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
-        print(f'  Validation Loss: {avg_vloss:.4f}, Validation RMSE: {val_rmse:.4f}')
-
-        history["train_loss"].append(train_loss)
-        history["train_rmse"].append(train_rmse)
-        history["val_loss"].append(avg_vloss)
-        history["val_rmse"].append(val_rmse)
-
-        if val_rmse < best_val_rmse:
-            best_val_rmse = val_rmse
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    return model, history
 
 def cross_validate_transformer(model_factory, cv_train_val_ds_at, train_val_datasets_at, loss_fn, optimizer_class,lag_n,
                                 config, batch_size, lr=1e-3/2, n_epochs=50, 
@@ -1761,11 +1689,23 @@ def build_autoregressive_training_data_fast_torch(
     feature_window_size: int,
     label_window_size: int = 1,
     shift: int = 1,
+    scheduled = False,
+    teacher_forcing_prob = 1.0,
     config: Optional[FeatureConfig] = None,
     batch_size: int = 64,
     device: Optional[torch.device] = None,
+    rng: Optional[np.random.Generator] = None,
+    rng_seed = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
     config = config or FeatureConfig()
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if rng_seed is not None:
+        rng = np.random.default_rng(rng_seed)
+    
+
     per_row_cols = config.time_varying + config.time_varying_no_target + config.static
     n_tvt = len(config.time_varying)
     n_other = len(config.time_varying_no_target)
@@ -1862,8 +1802,20 @@ def build_autoregressive_training_data_fast_torch(
                         y_arr = y_preds_all.cpu().numpy()
                     else:
                         y_arr = np.asarray(y_preds_all).reshape(-1)
-        
-                    windows[:, label_start, idx_twd_in_tvt] = y_arr
+
+                    
+
+                    if scheduled:
+                        # scheduled sampling mask: True -> use ground truth, False -> use prediction
+                        # shape: (n_windows,)
+                        use_truth = rng.random(n_windows) < teacher_forcing_prob
+
+                        # combine
+                        # we must not modify true_labels in-place, so create a new array
+                        updated_values = np.where(use_truth, true_labels, y_arr)
+                        windows[:, label_start, idx_twd_in_tvt] = updated_values
+                    else:
+                        windows[:, label_start, idx_twd_in_tvt] = y_arr
 
     if not X_dyn_list:
         return (
@@ -1978,6 +1930,127 @@ def cross_validation_torch_FT(
 
         # train (make sure your train_transformer accepts a `device` argument and trains the passed model)
         model_fold, history = train_transformer(model_fold, train_loader_cv, val_loader_cv, loss_fn, optimizer, n_epochs=n_epochs, device=device)
+
+        # evaluation 1-day (batch) predictions
+        model_fold.eval()
+        val_y_cv_1d_at = []
+        val_preds_cv_1d_at = []
+        with torch.no_grad():
+            for batch in val_loader_cv:
+                X_dyn_val, X_day_val, X_static_val, labels_val = batch
+                X_dyn_val = X_dyn_val.to(device, non_blocking=True)
+                X_day_val = X_day_val.to(device, non_blocking=True)
+                X_static_val = X_static_val.to(device, non_blocking=True)
+
+                outputs_val = model_fold(X_dyn_val, X_day_val, X_static_val)
+                val_y_cv_1d_at.append(labels_val.cpu().numpy())
+                val_preds_cv_1d_at.append(outputs_val.cpu().numpy())
+
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+        val_preds_cv_1d_at = np.concatenate(val_preds_cv_1d_at, axis=0)
+
+        # recursive evaluation — pass device if helper supports it, otherwise ensure model is on expected device
+        val_pred_recursive_at, val_true_recursive_at = compute_recursive_predictions_fast_torch(
+            model_fold, val_cv_dataset_at, feature_window_size=lag_n, label_window_size=1, shift=1,
+            config=config, batch_size=batch_size)
+
+        if if_log:
+            val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_true_recursive_at = np.exp2(val_true_recursive_at) - 1
+            val_preds_cv_1d_at = clip_and_inverse_log2_transform(val_preds_cv_1d_at)
+            val_y_cv_1d_at = np.exp2(val_y_cv_1d_at) - 1
+
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_preds_cv_1d_at)
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at, val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_preds_cv_1d_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+        historys_cv_at.append(history)
+
+    return rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+
+def cross_validation_torch_scheduled(
+    model_fold,
+    train_val_datasets_at,
+    lag_n,
+    config,
+    batch_size,
+    loss_fn,
+    optimizer_class,
+    lr=1e-3/2,
+    n_epochs=50,
+    slow_decay = True,
+    p_min = 0.1, 
+    warmup_epochs=3, 
+    frac_decay = 0.85, 
+    device=None,
+    if_log=False,
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+
+    # Save initial weights (PyTorch)
+    init_state = copy.deepcopy(model_fold.state_dict())
+
+    for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
+        print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
+
+        # reset model weights and move to device
+        model_fold.load_state_dict(init_state)
+        model_fold.to(device)
+        model_fold.train()
+
+        # build validation dataset tensors (ensure on CPU for DataLoader)
+        val_X_ts_at, val_day_feat_X_at, val_static_X_ts_at, val_y_at = get_dataset_NN_torch(
+            val_cv_dataset_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            autoregressive=True,
+            shift=1,
+            config=config,
+        )
+        val_X_ts_at = val_X_ts_at.cpu()
+        val_day_feat_X_at = val_day_feat_X_at.cpu()
+        val_static_X_ts_at = val_static_X_ts_at.cpu()
+        val_y_at = val_y_at.cpu()
+
+        val_loader_cv = DataLoader(
+            TensorDataset(val_X_ts_at, val_day_feat_X_at, val_static_X_ts_at, val_y_at),
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=(device.type == "cuda"),
+            num_workers=2,
+        )
+
+        # build training cv data with autoregressive training
+        # ensure the model used to generate AR data is on the device
+        model_fold.eval()   # prediction mode for AR data generation
+        # now prepare model & optimizer for training
+        optimizer = optimizer_class(model_fold.parameters(), lr=lr)
+
+        # train (make sure your train_transformer accepts a `device` argument and trains the passed model)
+        model_fold, history = train_transformer_scheduled(model_fold, train_cv_dataset_at, val_loader_cv, lag_n, 
+                                                          config, batch_size, 
+                                                            loss_fn, optimizer, n_epochs=n_epochs,
+                                                            p_min = 0.1, warmup_epochs=3, frac_decay = 0.85, 
+                                                            slow_decay = True,
+                                                            device=device,)
 
         # evaluation 1-day (batch) predictions
         model_fold.eval()
