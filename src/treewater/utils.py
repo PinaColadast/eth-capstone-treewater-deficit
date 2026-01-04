@@ -1616,7 +1616,177 @@ def train_LSTM_AR_scheduled(
 
 # example: model_factory = lambda: EncoderOnlyForecast(...).to(device)
 
-gi
+def train_one_epoch(model, epoch_index, train_loader, loss_fn, optimizer, device=None, log_every=100):
+    device = device or next(model.parameters()).device
+    running_loss = 0.0
+    sse = 0.0
+    n_samples = 0
+    n_batches = 0
+
+    model.train()
+    for i, batch in enumerate(train_loader):
+        X_dyn, X_day, X_static, labels = batch
+        X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(X_dyn, X_day, X_static)
+        loss = loss_fn(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += float(loss.item())
+        batch_sse = float(F.mse_loss(outputs, labels, reduction='sum').item())
+        sse += batch_sse
+        n_samples += labels.numel()
+        n_batches += 1
+
+        if (i + 1) % log_every == 0:
+            print(f'  batch {i+1} loss: {running_loss / n_batches:.4f}')
+
+    avg_batch_loss = running_loss / n_batches if n_batches > 0 else float("nan")
+    train_rmse = math.sqrt(sse / n_samples) if n_samples > 0 else float("nan")
+    return avg_batch_loss, train_rmse
+
+def train_transformer(model, train_loader, val_loader, loss_fn, optimizer, n_epochs=50, device=None):
+    device = device or next(model.parameters()).device
+    best_val_rmse = float("inf")
+    best_model_state = None
+    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
+
+    model.to(device)
+    for epoch in range(n_epochs):
+        print(f'Epoch {epoch + 1}/{n_epochs}')
+        train_loss, train_rmse = train_one_epoch(model, epoch, train_loader, loss_fn, optimizer, device=device)
+        print(f'  Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}')
+
+        # validation
+        model.eval()
+        val_sse = 0.0
+        val_batches = 0
+        val_n = 0
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
+                outputs = model(X_dyn, X_day, X_static)
+                vloss = loss_fn(outputs, labels)
+                val_loss_sum += float(vloss.item())
+                val_sse += float(F.mse_loss(outputs, labels, reduction='sum').item())
+                val_n += labels.numel()
+                val_batches += 1
+
+        avg_vloss = val_loss_sum / val_batches if val_batches > 0 else float("nan")
+        val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
+        print(f'  Validation Loss: {avg_vloss:.4f}, Validation RMSE: {val_rmse:.4f}')
+
+        history["train_loss"].append(train_loss)
+        history["train_rmse"].append(train_rmse)
+        history["val_loss"].append(avg_vloss)
+        history["val_rmse"].append(val_rmse)
+
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    return model, history
+
+
+
+def train_transformer_scheduled(
+    model, 
+    train_df_at, 
+    val_loader,
+    lag_n, 
+    config, 
+    batch_size,  
+    loss_fn, 
+    optimizer,
+    n_epochs=50, 
+    epoch_per_step = 5,
+    p_min = 0.1,
+    warmup_epochs = 3,
+    frac_decay = 0.8,
+    slow_decay = True, device=None):
+
+    device = device or next(model.parameters()).device
+    best_val_rmse = float("inf")
+    best_model_state = None
+    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": [], "p_tf":[]}
+
+    if slow_decay:
+        teacher_forcing_prob_fn = partial(teacher_forcing_prob_stepwise, epoch_per_step=epoch_per_step)
+    else:
+        teacher_forcing_prob_fn = teacher_forcing_prob
+
+    model.to(device)
+
+    for epoch in range(n_epochs):
+        print(f'Epoch {epoch + 1}/{n_epochs}')
+
+        
+        p_tf = teacher_forcing_prob_fn(epoch, n_epochs, p0=1.0, p_min=p_min, warmup_epochs=warmup_epochs, frac_decay=frac_decay)
+        X_dyn_train, X_day_train, X_static_train, y_train = build_autoregressive_training_data_fast_torch(
+            model=model,
+            df=train_df_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            shift=1,
+            config=config,
+            batch_size=64,
+            scheduled = True,
+            teacher_forcing_prob= p_tf,
+            device = device,
+            rng_seed=42
+        )
+
+        train_loader =  DataLoader(
+            TensorDataset(X_dyn_train.to("cpu"), X_day_train.to("cpu"), X_static_train.to("cpu"), y_train.to("cpu")),
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=(device.type == "cuda"),
+            num_workers=4,
+        )
+
+        train_loss, train_rmse = train_one_epoch(model, epoch, train_loader, loss_fn, optimizer, device=device)
+
+        print(f'  Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}, p_tf: {p_tf:.4f}')
+        # validation
+        model.eval()
+        val_sse = 0.0
+        val_batches = 0
+        val_n = 0
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
+                outputs = model(X_dyn, X_day, X_static)
+                vloss = loss_fn(outputs, labels)
+                val_loss_sum += float(vloss.item())
+                val_sse += float(F.mse_loss(outputs, labels, reduction='sum').item())
+                val_n += labels.numel()
+                val_batches += 1
+
+        avg_vloss = val_loss_sum / val_batches if val_batches > 0 else float("nan")
+        val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
+        print(f'  Validation Loss: {avg_vloss:.4f}, Validation RMSE: {val_rmse:.4f}')
+
+        history["train_loss"].append(train_loss)
+        history["train_rmse"].append(train_rmse)
+        history["val_loss"].append(avg_vloss)
+        history["val_rmse"].append(val_rmse)
+
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    return model, history
+
 
 
 
@@ -2050,7 +2220,7 @@ def cross_validation_torch_scheduled(
                                                             loss_fn, optimizer, n_epochs=n_epochs,
                                                             p_min = 0.1, warmup_epochs=3, frac_decay = 0.85, 
                                                             slow_decay = True,
-                                                            device=device,)
+                                                            device=device)
 
         # evaluation 1-day (batch) predictions
         model_fold.eval()
