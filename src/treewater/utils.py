@@ -1858,7 +1858,11 @@ def build_autoregressive_training_data_fast_torch(
                             cur += bs
 
                     # overwrite twd at label_start for next steps
-                    windows[:, label_start, idx_twd_in_tvt] = y_preds_all.reshape(-1, 1)
+                    if isinstance(y_preds_all, torch.Tensor):
+                        y_arr = y_preds_all.cpu().numpy()
+                    else:
+                        y_arr = np.asarray(y_preds_all)
+                    windows[:, label_start, idx_twd_in_tvt] = y_arr.reshape(-1, 1)
 
     if not X_dyn_list:
         return (
@@ -1881,11 +1885,6 @@ def build_autoregressive_training_data_fast_torch(
 
     return X_dyn_ar, X_day_ar, X_static_ar, y_ar
 
-
-import copy
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
 
 def cross_validation_torch_FT(
     model_fold,
@@ -1955,6 +1954,7 @@ def cross_validation_torch_FT(
             shift=1,
             config=config,
             batch_size=batch_size,
+            device = device
         )
 
         # put AR-built tensors on CPU for DataLoader
@@ -1999,8 +1999,7 @@ def cross_validation_torch_FT(
         # recursive evaluation — pass device if helper supports it, otherwise ensure model is on expected device
         val_pred_recursive_at, val_true_recursive_at = compute_recursive_predictions_fast_torch(
             model_fold, val_cv_dataset_at, feature_window_size=lag_n, label_window_size=1, shift=1,
-            config=config, batch_size=batch_size, device=device
-        )
+            config=config, batch_size=batch_size)
 
         if if_log:
             val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
