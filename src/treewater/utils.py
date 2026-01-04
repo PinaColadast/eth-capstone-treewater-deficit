@@ -1,13 +1,21 @@
+import math
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import torch
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+
 from functools import partial
 from typing import Tuple, List, Optional, Union
 from dataclasses import dataclass, field
 from functools import lru_cache
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_squared_error, root_mean_squared_error
+
 
 
 @dataclass
@@ -1601,6 +1609,419 @@ def train_LSTM_AR_scheduled(
         )
 
     return history_ar_at, model_at_ar
+
+
+## training functions for transformer
+
+# example: model_factory = lambda: EncoderOnlyForecast(...).to(device)
+
+def train_one_epoch(model, epoch_index, train_loader, loss_fn, optimizer, device=None, log_every=100):
+    device = device or next(model.parameters()).device
+    running_loss = 0.0
+    sse = 0.0
+    n_samples = 0
+    n_batches = 0
+
+    model.train()
+    for i, batch in enumerate(train_loader):
+        X_dyn, X_day, X_static, labels = batch
+        X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(X_dyn, X_day, X_static)
+        loss = loss_fn(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += float(loss.item())
+        batch_sse = float(F.mse_loss(outputs, labels, reduction='sum').item())
+        sse += batch_sse
+        n_samples += labels.numel()
+        n_batches += 1
+
+        if (i + 1) % log_every == 0:
+            print(f'  batch {i+1} loss: {running_loss / n_batches:.4f}')
+
+    avg_batch_loss = running_loss / n_batches if n_batches > 0 else float("nan")
+    train_rmse = math.sqrt(sse / n_samples) if n_samples > 0 else float("nan")
+    return avg_batch_loss, train_rmse
+
+def train_transformer(model, train_loader, val_loader, loss_fn, optimizer, n_epochs=50, device=None):
+    device = device or next(model.parameters()).device
+    best_val_rmse = float("inf")
+    best_model_state = None
+    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
+
+    model.to(device)
+    for epoch in range(n_epochs):
+        print(f'Epoch {epoch + 1}/{n_epochs}')
+        train_loss, train_rmse = train_one_epoch(model, epoch, train_loader, loss_fn, optimizer, device=device)
+        print(f'  Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}')
+
+        # validation
+        model.eval()
+        val_sse = 0.0
+        val_batches = 0
+        val_n = 0
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
+                outputs = model(X_dyn, X_day, X_static)
+                vloss = loss_fn(outputs, labels)
+                val_loss_sum += float(vloss.item())
+                val_sse += float(F.mse_loss(outputs, labels, reduction='sum').item())
+                val_n += labels.numel()
+                val_batches += 1
+
+        avg_vloss = val_loss_sum / val_batches if val_batches > 0 else float("nan")
+        val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
+        print(f'  Validation Loss: {avg_vloss:.4f}, Validation RMSE: {val_rmse:.4f}')
+
+        history["train_loss"].append(train_loss)
+        history["train_rmse"].append(train_rmse)
+        history["val_loss"].append(avg_vloss)
+        history["val_rmse"].append(val_rmse)
+
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    return model, history
+
+def cross_validate_transformer(model_factory, cv_train_val_ds_at, train_val_datasets_at, loss_fn, optimizer_class,lag_n,
+                                config, batch_size, lr=1e-3/2, n_epochs=50, 
+                                device=None,
+                                if_log = False):
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+
+    for fold, (train_loader, val_loader) in enumerate(cv_train_val_ds_at):
+        print(f'Starting fold {fold + 1}/{len(cv_train_val_ds_at)}')
+        model_fold = model_factory().to(device) if device else model_factory()
+        optimizer = optimizer_class(model_fold.parameters(), lr=lr)
+
+        model_fold, history = train_transformer(model_fold, train_loader, val_loader, loss_fn, optimizer, n_epochs=n_epochs)
+
+        model_fold.eval()
+        val_y_cv_1d_at = []
+        val_preds_cv_1d_at = []
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device)
+                outputs = model_fold(X_dyn, X_day, X_static)
+                val_y_cv_1d_at.append(labels.cpu().numpy())
+                val_preds_cv_1d_at.append(outputs.cpu().numpy())
+
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+        val_preds_cv_1d_at = np.concatenate(val_preds_cv_1d_at, axis=0)
+        
+
+        # recursive evaluation (ensure compute_recursive_predictions_fast_torch expects a model on CPU or device you pass)
+        val_cv_df_at = train_val_datasets_at[fold][1]
+        val_pred_recursive_at, val_true_recursive_at = compute_recursive_predictions_fast_torch(
+            model_fold, val_cv_df_at, feature_window_size=lag_n, label_window_size=1, shift=1,
+            config=config, batch_size=batch_size)
+
+        if if_log == True:
+          val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+          val_true_recursive_at = np.exp2(val_true_recursive_at)-1
+          
+          val_preds_cv_1d_at = clip_and_inverse_log2_transform(val_preds_cv_1d_at)
+          val_y_cv_1d_at = np.exp2(val_y_cv_1d_at)-1
+
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_preds_cv_1d_at)
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at, val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_preds_cv_1d_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+        historys_cv_at.append(history)
+
+    return rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+def build_autoregressive_training_data_fast_torch(
+    model,
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    config: Optional[FeatureConfig] = None,
+    batch_size: int = 64,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    config = config or FeatureConfig()
+    per_row_cols = config.time_varying + config.time_varying_no_target + config.static
+    n_tvt = len(config.time_varying)
+    n_other = len(config.time_varying_no_target)
+    n_static = len(config.static)
+    idx_twd_in_tvt = config.time_varying.index("twd")
+
+    X_dyn_list = []
+    X_day_list = []
+    X_static_list = []
+    y_list = []
+
+    # device management
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except Exception:
+            device = torch.device("cpu")
+    model_eval_device = device
+    model = model.to(model_eval_device)
+    model.eval()
+
+    for site in df.site_name.unique():
+        df_site = df.loc[df["site_name"] == site, :]
+        for sp in df_site["species"].unique():
+            df_group = (
+                df_site[df_site["species"] == sp]
+                .sort_values("ts", ascending=True)
+                .reset_index(drop=True)
+            )
+            n_sample = len(df_group)
+            window_len = 2 * feature_window_size + 1
+            n_windows = n_sample - 2 * feature_window_size - label_window_size - shift + 1
+            if n_windows <= 0:
+                continue
+
+            arr = df_group[per_row_cols].to_numpy(dtype=float)  # (n_sample, cols)
+            windows = np.stack([arr[i : i + window_len] for i in range(n_windows)], axis=0)  # (n_windows, window_len, cols)
+
+            idx_tvd = list(range(0, n_tvt))
+            idx_other = list(range(n_tvt, n_tvt + n_other))
+            idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+            for step in range(0, feature_window_size + 1):
+                start = step
+                end = start + feature_window_size  # history indices [start:end), current day = end
+
+                tv_block = windows[:, start:end, :][:, :, idx_tvd]  # (n_windows, feature_window_size, n_tvt)
+
+                other_feats = (
+                    windows[:, end, :][:, idx_other].copy() if n_other > 0 else np.empty((n_windows, 0), dtype=float)
+                )
+                static_feats = (
+                    windows[:, end, :][:, idx_static].copy() if n_static > 0 else np.empty((n_windows, 0), dtype=float)
+                )
+
+                label_start = step + feature_window_size + shift - 1
+                label_end = label_start + label_window_size
+                if label_start < 0 or label_end > window_len:
+                    continue
+
+                true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1)
+
+                if step == feature_window_size:
+                    X_dyn_list.append(tv_block)
+                    X_day_list.append(other_feats)
+                    X_static_list.append(static_feats)
+                    y_list.append(true_labels)
+
+                if step < feature_window_size:
+                    # batch predictions
+                    t_tv = torch.from_numpy(tv_block).float()
+                    t_other = torch.from_numpy(other_feats).float() if n_other > 0 else torch.empty((n_windows, 0), dtype=torch.float32)
+                    t_static = torch.from_numpy(static_feats).float() if n_static > 0 else torch.empty((n_windows, 0), dtype=torch.float32)
+
+                    ds = TensorDataset(t_tv, t_other, t_static)
+                    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=torch.cuda.is_available(), num_workers=0)
+
+                    y_preds_all = np.empty((n_windows,), dtype=float)
+                    cur = 0
+                    with torch.no_grad():
+                        for batch in loader:
+                            tv_b = batch[0].to(model_eval_device, non_blocking=True)
+                            other_b = batch[1].to(model_eval_device, non_blocking=True) if n_other > 0 else torch.empty((tv_b.size(0), 0), device=model_eval_device)
+                            static_b = batch[2].to(model_eval_device, non_blocking=True) if n_static > 0 else torch.empty((tv_b.size(0), 0), device=model_eval_device)
+
+                            out = model(tv_b, other_b, static_b)
+                            preds = out.squeeze(-1).detach().cpu().numpy().reshape(-1)
+                            bs = preds.shape[0]
+                            y_preds_all[cur : cur + bs] = preds
+                            cur += bs
+
+                    # overwrite twd at label_start for next steps
+                    windows[:, label_start, idx_twd_in_tvt] = y_preds_all.reshape(-1, 1)
+
+    if not X_dyn_list:
+        return (
+            torch.empty((0, feature_window_size, n_tvt), dtype=torch.float32),
+            torch.empty((0, n_other), dtype=torch.float32),
+            torch.empty((0, n_static), dtype=torch.float32),
+            torch.empty((0,), dtype=torch.float32),
+        )
+
+    X_dyn_ar = torch.from_numpy(np.concatenate(X_dyn_list, axis=0)).float()
+    X_day_ar = torch.from_numpy(np.concatenate(X_day_list, axis=0)).float()
+    X_static_ar = torch.from_numpy(np.concatenate(X_static_list, axis=0)).float()
+    y_ar = torch.from_numpy(np.concatenate(y_list, axis=0)).float()
+
+    # return tensors on CPU (safe for DataLoader / training). If you prefer device tensors, call .to(device) on the outputs.
+    X_dyn_ar = X_dyn_ar.cpu()
+    X_day_ar = X_day_ar.cpu()
+    X_static_ar = X_static_ar.cpu()
+    y_ar = y_ar.cpu()
+
+    return X_dyn_ar, X_day_ar, X_static_ar, y_ar
+
+
+import copy
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+
+def cross_validation_torch_FT(
+    model_fold,
+    train_val_datasets_at,
+    lag_n,
+    config,
+    batch_size,
+    loss_fn,
+    optimizer_class,
+    lr=1e-3/2,
+    n_epochs=50,
+    device=None,
+    if_log=False,
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+
+    # Save initial weights (PyTorch)
+    init_state = copy.deepcopy(model_fold.state_dict())
+
+    for i, (train_cv_dataset_at, val_cv_dataset_at) in enumerate(train_val_datasets_at):
+        print(f"Training fold {i+1}/{len(train_val_datasets_at)}")
+
+        # reset model weights and move to device
+        model_fold.load_state_dict(init_state)
+        model_fold.to(device)
+        model_fold.train()
+
+        # build validation dataset tensors (ensure on CPU for DataLoader)
+        val_X_ts_at, val_day_feat_X_at, val_static_X_ts_at, val_y_at = get_dataset_NN_torch(
+            val_cv_dataset_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            autoregressive=True,
+            shift=1,
+            config=config,
+        )
+        val_X_ts_at = val_X_ts_at.cpu()
+        val_day_feat_X_at = val_day_feat_X_at.cpu()
+        val_static_X_ts_at = val_static_X_ts_at.cpu()
+        val_y_at = val_y_at.cpu()
+
+        val_loader_cv = DataLoader(
+            TensorDataset(val_X_ts_at, val_day_feat_X_at, val_static_X_ts_at, val_y_at),
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=(device.type == "cuda"),
+            num_workers=2,
+        )
+
+        # build training cv data with autoregressive training
+        # ensure the model used to generate AR data is on the device
+        model_fold.eval()   # prediction mode for AR data generation
+        X_dyn_ar, X_day_ar, X_static_ar, y_ar = build_autoregressive_training_data_fast_torch(
+            model=model_fold,
+            df=train_cv_dataset_at,
+            feature_window_size=lag_n,
+            label_window_size=1,
+            shift=1,
+            config=config,
+            batch_size=batch_size,
+        )
+
+        # put AR-built tensors on CPU for DataLoader
+        X_dyn_ar = X_dyn_ar.cpu()
+        X_day_ar = X_day_ar.cpu()
+        X_static_ar = X_static_ar.cpu()
+        y_ar = y_ar.cpu()
+
+        train_loader_cv = DataLoader(
+            TensorDataset(X_dyn_ar, X_day_ar, X_static_ar, y_ar),
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=(device.type == "cuda"),
+            num_workers=4,
+        )
+
+        # now prepare model & optimizer for training
+        model_fold.train()
+        optimizer = optimizer_class(model_fold.parameters(), lr=lr)
+
+        # train (make sure your train_transformer accepts a `device` argument and trains the passed model)
+        model_fold, history = train_transformer(model_fold, train_loader_cv, val_loader_cv, loss_fn, optimizer, n_epochs=n_epochs, device=device)
+
+        # evaluation 1-day (batch) predictions
+        model_fold.eval()
+        val_y_cv_1d_at = []
+        val_preds_cv_1d_at = []
+        with torch.no_grad():
+            for batch in val_loader_cv:
+                X_dyn_val, X_day_val, X_static_val, labels_val = batch
+                X_dyn_val = X_dyn_val.to(device, non_blocking=True)
+                X_day_val = X_day_val.to(device, non_blocking=True)
+                X_static_val = X_static_val.to(device, non_blocking=True)
+
+                outputs_val = model_fold(X_dyn_val, X_day_val, X_static_val)
+                val_y_cv_1d_at.append(labels_val.cpu().numpy())
+                val_preds_cv_1d_at.append(outputs_val.cpu().numpy())
+
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+        val_preds_cv_1d_at = np.concatenate(val_preds_cv_1d_at, axis=0)
+
+        # recursive evaluation — pass device if helper supports it, otherwise ensure model is on expected device
+        val_pred_recursive_at, val_true_recursive_at = compute_recursive_predictions_fast_torch(
+            model_fold, val_cv_dataset_at, feature_window_size=lag_n, label_window_size=1, shift=1,
+            config=config, batch_size=batch_size, device=device
+        )
+
+        if if_log:
+            val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_true_recursive_at = np.exp2(val_true_recursive_at) - 1
+            val_preds_cv_1d_at = clip_and_inverse_log2_transform(val_preds_cv_1d_at)
+            val_y_cv_1d_at = np.exp2(val_y_cv_1d_at) - 1
+
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_preds_cv_1d_at)
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at, val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_preds_cv_1d_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+        historys_cv_at.append(history)
+
+    return rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
 
 
 
