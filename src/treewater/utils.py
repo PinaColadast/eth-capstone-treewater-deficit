@@ -1861,8 +1861,9 @@ def build_autoregressive_training_data_fast_torch(
                     if isinstance(y_preds_all, torch.Tensor):
                         y_arr = y_preds_all.cpu().numpy()
                     else:
-                        y_arr = np.asarray(y_preds_all)
-                    windows[:, label_start, idx_twd_in_tvt] = y_arr.reshape(-1, 1)
+                        y_arr = np.asarray(y_preds_all).reshape(-1)
+        
+                    windows[:, label_start, idx_twd_in_tvt] = y_arr
 
     if not X_dyn_list:
         return (
