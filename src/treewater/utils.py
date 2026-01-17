@@ -1039,6 +1039,7 @@ def cross_validate_datasets(train_df, n_splits=4, feature_window_size=13, config
 
 
 def build_ds_from_get_dataset_LSTM(df_split, feature_window_size, config,
+                                   label_window_size = 1,
                                    autoregressive=True, shift=1, batch_size=64):
     """Build a tf.data.Dataset from the 3-input output of get_dataset_LSTM.
     Robustly handles outputs that are already tf.Tensors (EagerTensor) or numpy-like.
@@ -1046,7 +1047,7 @@ def build_ds_from_get_dataset_LSTM(df_split, feature_window_size, config,
     X_ts, day_feat, static_X, y = get_dataset_LSTM(
         df_split,
         feature_window_size=feature_window_size,
-        label_window_size=1,
+        label_window_size=label_window_size,
         autoregressive=autoregressive,
         shift=shift,
         config=config,
@@ -1127,6 +1128,7 @@ def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at,
 
 
 def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, batch_size,
+                            label_window_size = 1,
                              num_epochs=40):
     maes_cv_at = []
     rmses_cv_at = []
@@ -1147,6 +1149,7 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
         feature_window_size=lag_n,
         config=config,
         autoregressive=True,
+        label_window_size = label_window_size,
         shift=1,
         batch_size=batch_size,
     )   
@@ -1216,6 +1219,7 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
 def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, batch_size,
                              num_epochs=40,
                              p_min = 0.1, warmup_epochs = 3, frac_decay = 0.8,
+                             label_window_size = 1,
                              slow_decay = True):
     
     maes_cv_at = []
@@ -1237,6 +1241,7 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
         feature_window_size=lag_n,
         config=config,
         autoregressive=True,
+        label_window_size = label_window_size,
         shift=1,
         batch_size=batch_size,
     )   
