@@ -1762,6 +1762,54 @@ def train_transformer(model, train_loader, val_loader, loss_fn, optimizer, n_epo
     return model, history
 
 
+def train_transformer_horizon(model, train_loader, val_loader, loss_fn, optimizer, n_epochs=50, device=None):
+    device = device or next(model.parameters()).device
+    best_val_rmse = float("inf")
+    best_model_state = None
+    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
+
+    model.to(device)
+    for epoch in range(n_epochs):
+        print(f'Epoch {epoch + 1}/{n_epochs}')
+        train_loss, train_rmse = train_one_epoch(model, epoch, train_loader, loss_fn, optimizer, device=device)
+        print(f'  Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}')
+
+        # validation
+        model.eval()
+        val_sse = 0.0
+        val_batches = 0
+        val_n = 0
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); labels = labels.to(device)
+                outputs = model(X_dyn, X_day, X_static)
+                vloss = loss_fn(outputs, labels)
+                val_loss_sum += float(vloss.item())
+                val_sse += float(F.mse_loss(outputs, labels, reduction='mean').item())
+                val_n += labels.numel()
+                val_batches += 1
+
+        avg_vloss = val_loss_sum / val_batches if val_batches > 0 else float("nan")
+        val_rmse = val_sse / val_n if val_n > 0 else float("nan")
+        print(f'Validation Loss: {avg_vloss:.4f}, Validation RMSE: {val_rmse:.4f}')
+
+        history["train_loss"].append(train_loss)
+        history["train_rmse"].append(train_rmse)
+        history["val_loss"].append(avg_vloss)
+        history["val_rmse"].append(val_rmse)
+
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    return model, history
+
+
+
 
 def train_transformer_scheduled(
     model, 
@@ -1919,6 +1967,56 @@ def cross_validate_transformer(model_factory, cv_train_val_ds_at, train_val_data
         historys_cv_at.append(history)
 
     return rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+def cross_validate_transformer_horizon(model_factory, cv_train_val_ds_at, train_val_datasets_at, loss_fn, optimizer_class,lag_n,
+                                config, batch_size, lr=1e-3/2, n_epochs=50, 
+                                device=None,
+                                if_log = False):
+    rmses_cv_horizon = []
+    r2s_cv_horizon = []
+    y_preds_cv_horizon = []
+    y_trues_cv_horizon = []
+    historys_cv_at = []
+
+    for fold, (train_loader, val_loader) in enumerate(cv_train_val_ds_at):
+        print(f'Starting fold {fold + 1}/{len(cv_train_val_ds_at)}')
+        model_fold = model_factory().to(device) if device else model_factory()
+        optimizer = optimizer_class(model_fold.parameters(), lr=lr)
+
+        model_fold, history = train_transformer_horizon(model_fold, train_loader, val_loader, loss_fn, optimizer, n_epochs=n_epochs)
+
+        model_fold.eval()
+        val_y_cv_horizon = []
+        val_preds_cv_horizon = []
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device)
+                outputs = model_fold(X_dyn, X_day, X_static)
+                val_y_cv_horizon.append(labels.cpu().numpy())
+                val_preds_cv_horizon.append(outputs.cpu().numpy())
+
+        val_y_cv_horizon = np.concatenate(val_y_cv_horizon, axis=0)
+        val_preds_cv_horizon = np.concatenate(val_preds_cv_horizon, axis=0)
+
+
+        if if_log == True:
+          val_preds_cv_horizon = clip_and_inverse_log2_transform(val_preds_cv_horizon)
+          val_y_cv_horizon = np.exp2(val_y_cv_horizon)-1
+          
+        rmses_cv_horizon_fold = [root_mean_squared_error(val_y_cv_horizon[:, i],val_preds_cv_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
+        r2s_cv_horizon_fold = [r2_score(val_y_cv_horizon[:, i],val_preds_cv_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
+
+        rmses_cv_horizon.append(rmses_cv_horizon_fold)
+        r2s_cv_horizon.append(r2s_cv_horizon_fold)
+        y_trues_cv_horizon.append(val_y_cv_horizon)
+        y_preds_cv_horizon.append(val_preds_cv_horizon)
+
+        historys_cv_at.append(history)
+
+    return rmses_cv_horizon, r2s_cv_horizon, y_trues_cv_horizon, y_preds_cv_horizon, historys_cv_horizon
+
 
 
 def build_autoregressive_training_data_fast_torch(
