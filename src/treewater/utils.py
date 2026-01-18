@@ -130,6 +130,7 @@ def get_feature_windows_LSTM(
     config: Optional[FeatureConfig] = None
 ):  
     
+    config = config or FeatureConfig()
 
     n_tvt = len(config.time_varying)
     n_other = len(config.time_varying_no_target)
@@ -137,7 +138,7 @@ def get_feature_windows_LSTM(
 
 
     n_sample = len(df)
-    window_len = feature_window_size + 1 
+    window_len = feature_window_size + 1 + shift - 1 + label_window_size
     n_windows = n_sample - feature_window_size - label_window_size - shift + 1
     per_row_cols = config.time_varying + config.time_varying_no_target + config.static
     
@@ -148,7 +149,12 @@ def get_feature_windows_LSTM(
     if n_windows <= 0:
         # return empty arrays with sensible shapes
         tv_cols = n_tvt * feature_window_size
-        return (np.empty((0, tv_cols)), np.empty((0, n_other)), np.empty((0, n_static)), np.empty((0,)))
+        return (
+            np.empty((0, tv_cols)),
+            np.empty((0, n_other)),
+            np.empty((0, n_static)),
+            np.empty((0, label_window_size)),
+        )
 
     # convert to numpy once
     arr = df[per_row_cols].to_numpy(dtype=float)  # shape (n_sample, cols)
@@ -178,7 +184,8 @@ def get_feature_windows_LSTM(
     label_start = start + feature_window_size + shift - 1
     label_end = label_start + label_window_size
 
-    labels = windows[:, label_start, idx_twd_in_tvt]
+    labels = windows[:, label_start:label_end, idx_twd_in_tvt]
+    labels = labels.reshape(n_windows, label_window_size)
 
     return tv_block, pred_day_other_feats, static_feats, labels 
 
@@ -231,7 +238,7 @@ def get_dataset_LSTM(
         tv_block_arr = np.empty((0, feature_window_size,  n_tvt), dtype=float)
         pred_day_other_feats_arr = np.empty((0, n_other), dtype=float)
         static_feats_arr = np.empty((0, n_static), dtype=float)
-        labels_arr = np.empty((0,), dtype=float)
+        labels_arr = np.empty((0, label_window_size), dtype=float)
 
     tv_block_tf = tf.convert_to_tensor(tv_block_arr, dtype=tf.float32)
     pred_day_other_feats_tf = tf.convert_to_tensor(pred_day_other_feats_arr, dtype=tf.float32)
@@ -1124,6 +1131,67 @@ def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at,
         y_trues_cv_at.append(val_true_recursive_at)
     
     return maes_cv_at, rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+
+def cross_validation_LSTM_Horizon(model_fold, cv_train_val_ds_at, train_val_datasets_at, lag_n, config, batch_size,
+                          num_epochs=40):
+    
+    losses_cv_horizon= []
+    maes_cv_horizon = []
+    rmses_cv_horizon_mean = []
+    r2s_cv_horizons = []
+    rmses_cv_horizons = []
+    y_preds_cv_horizon = []
+    y_trues_cv_horizon = []
+    historys_cv_horizon = []
+
+    init_weights = model_fold.get_weights()
+    for i, (train_cv_ds_at, val_cv_ds_at) in enumerate(cv_train_val_ds_at):
+        print(f"Training fold {i+1}/{len(cv_train_val_ds_at)}")
+        # implement random seed
+        # re-initialize model weights before training on each fold
+        tf.keras.backend.clear_session()  # optional but helps in notebooks
+
+        model_fold_cv = model_fold
+        model_fold_cv.set_weights(init_weights)
+        # Train the model
+        history_cv_at = model_fold_cv.fit(
+            train_cv_ds_at,
+            validation_data=val_cv_ds_at,
+            epochs=num_epochs,
+            verbose=1
+        )
+        historys_cv_horizon.append(history_cv_at)
+        # Evaluate on validation set
+        val_loss_horizon, val_rmse_horizon, val_mae_horizon = model_fold_cv.evaluate(val_cv_ds_at, verbose=0)
+        val_pred_horizon = model_fold_cv.predict(val_cv_ds_at)
+        val_y_cv_horizon = []
+        for _, y_batch in val_cv_ds_at:
+            val_y_cv_horizon.append(y_batch.numpy())
+        val_y_cv_horizon = np.concatenate(val_y_cv_horizon, axis=0)
+
+        
+
+        
+
+        
+        # compute rmse and r2 along the trajectory
+        rmses_cv_horizon = [root_mean_squared_error(val_y_cv_horizon[:, i],val_pred_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
+        r2s_cv_horizon = [r2_score(val_y_cv_horizon[:, i],val_pred_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
+        
+
+        losses_cv_horizon.append(val_loss_horizon)
+        maes_cv_horizon.append(val_mae_horizon)
+        rmses_cv_horizon_mean.append(val_rmse_horizon) # val rmse horizon is the mean of rmse across horizon
+
+        rmses_cv_horizons.append(rmses_cv_horizon) # a matrix of rmse across horizons across cv fold
+        r2s_cv_horizons.append(r2s_cv_horizon) 
+        y_preds_cv_horizon.append(val_pred_horizon)
+        y_trues_cv_horizon.append(val_y_cv_horizon)
+    
+    return losses_cv_horizon, maes_cv_horizon, rmses_cv_horizon_mean, rmses_cv_horizons, r2s_cv_horizons,  y_preds_cv_horizon, y_trues_cv_horizon, historys_cv_horizon
+
 
 
 
