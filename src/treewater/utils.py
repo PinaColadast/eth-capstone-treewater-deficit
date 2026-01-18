@@ -1772,7 +1772,7 @@ def train_transformer_horizon(model, train_loader, val_loader, loss_fn, optimize
     for epoch in range(n_epochs):
         print(f'Epoch {epoch + 1}/{n_epochs}')
         train_loss, train_rmse = train_one_epoch(model, epoch, train_loader, loss_fn, optimizer, device=device)
-        print(f'  Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}')
+        print(f'Train Loss: {train_loss:.4f}, Train RMSE: {train_rmse:.4f}')
 
         # validation
         model.eval()
@@ -1787,7 +1787,7 @@ def train_transformer_horizon(model, train_loader, val_loader, loss_fn, optimize
                 outputs = model(X_dyn, X_day, X_static)
                 vloss = loss_fn(outputs, labels)
                 val_loss_sum += float(vloss.item())
-                val_sse += float(F.mse_loss(outputs, labels, reduction='mean').item())
+                val_sse += float(F.mse_loss(outputs, labels, reduction='mean').item()) # need to fix this
                 val_n += labels.numel()
                 val_batches += 1
 
