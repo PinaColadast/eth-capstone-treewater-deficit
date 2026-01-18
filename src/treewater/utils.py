@@ -1171,11 +1171,6 @@ def cross_validation_LSTM_Horizon(model_fold, cv_train_val_ds_at, train_val_data
             val_y_cv_horizon.append(y_batch.numpy())
         val_y_cv_horizon = np.concatenate(val_y_cv_horizon, axis=0)
 
-        
-
-        
-
-        
         # compute rmse and r2 along the trajectory
         rmses_cv_horizon = [root_mean_squared_error(val_y_cv_horizon[:, i],val_pred_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
         r2s_cv_horizon = [r2_score(val_y_cv_horizon[:, i],val_pred_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
