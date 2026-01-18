@@ -1977,7 +1977,7 @@ def cross_validate_transformer_horizon(model_factory, cv_train_val_ds_at, train_
     r2s_cv_horizon = []
     y_preds_cv_horizon = []
     y_trues_cv_horizon = []
-    historys_cv_at = []
+    historys_cv_horizon = []
 
     for fold, (train_loader, val_loader) in enumerate(cv_train_val_ds_at):
         print(f'Starting fold {fold + 1}/{len(cv_train_val_ds_at)}')
@@ -2013,7 +2013,7 @@ def cross_validate_transformer_horizon(model_factory, cv_train_val_ds_at, train_
         y_trues_cv_horizon.append(val_y_cv_horizon)
         y_preds_cv_horizon.append(val_preds_cv_horizon)
 
-        historys_cv_at.append(history)
+        historys_cv_horizon.append(history)
 
     return rmses_cv_horizon, r2s_cv_horizon, y_trues_cv_horizon, y_preds_cv_horizon, historys_cv_horizon
 
