@@ -1787,12 +1787,12 @@ def train_transformer_horizon(model, train_loader, val_loader, loss_fn, optimize
                 outputs = model(X_dyn, X_day, X_static)
                 vloss = loss_fn(outputs, labels)
                 val_loss_sum += float(vloss.item())
-                val_sse += float(F.mse_loss(outputs, labels, reduction='mean').item()) # need to fix this
+                val_sse += float(F.mse_loss(outputs, labels, reduction='mean').item()) * labels.numel()
                 val_n += labels.numel()
                 val_batches += 1
 
         avg_vloss = val_loss_sum / val_batches if val_batches > 0 else float("nan")
-        val_rmse = val_sse / val_n if val_n > 0 else float("nan")
+        val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
         print(f'Validation Loss: {avg_vloss:.4f}, Validation RMSE: {val_rmse:.4f}')
 
         history["train_loss"].append(train_loss)
@@ -1994,20 +1994,27 @@ def cross_validate_transformer_horizon(model_factory, cv_train_val_ds_at, train_
                 X_dyn, X_day, X_static, labels = batch
                 X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device)
                 outputs = model_fold(X_dyn, X_day, X_static)
+                # print(f"label shape is {labels.shape}")
                 val_y_cv_horizon.append(labels.cpu().numpy())
                 val_preds_cv_horizon.append(outputs.cpu().numpy())
 
         val_y_cv_horizon = np.concatenate(val_y_cv_horizon, axis=0)
         val_preds_cv_horizon = np.concatenate(val_preds_cv_horizon, axis=0)
+        # print(val_preds_cv_horizon.shape)
+        # print(val_y_cv_horizon.shape)
 
 
         if if_log == True:
           val_preds_cv_horizon = clip_and_inverse_log2_transform(val_preds_cv_horizon)
           val_y_cv_horizon = np.exp2(val_y_cv_horizon)-1
           
+        # print(val_preds_cv_horizon.shape)
+        # print(val_y_cv_horizon.shape)
         rmses_cv_horizon_fold = [root_mean_squared_error(val_y_cv_horizon[:, i],val_preds_cv_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
         r2s_cv_horizon_fold = [r2_score(val_y_cv_horizon[:, i],val_preds_cv_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
-
+        
+        # print(rmses_cv_horizon_fold)
+        # print(r2s_cv_horizon_fold)
         rmses_cv_horizon.append(rmses_cv_horizon_fold)
         r2s_cv_horizon.append(r2s_cv_horizon_fold)
         y_trues_cv_horizon.append(val_y_cv_horizon)
@@ -2437,7 +2444,7 @@ def cross_validation_torch_scheduled(
 
 ## processing functions 
 
-def clip_and_inverse_log2_transform(y_pred: np.ndarray) -> np.ndarray:
+def clip_and_inverse_log2_transform(y_pred: np.ndarray, epsilon =1) -> np.ndarray:
     """
     Clips negative predictions to zero and applies inverse log2 transformation.
     
@@ -2447,4 +2454,4 @@ def clip_and_inverse_log2_transform(y_pred: np.ndarray) -> np.ndarray:
     Returns:
         Array of predictions in original scale with negatives clipped to zero
     """
-    return np.clip(np.power(2, y_pred) - 1, a_min=0, a_max=None)
+    return np.clip(np.power(2, y_pred) - epsilon, a_min=0, a_max=None)
