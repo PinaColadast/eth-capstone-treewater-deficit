@@ -1359,7 +1359,7 @@ def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at,
 
 
 def cross_validation_LSTM_Horizon(model_fold, cv_train_val_ds_at, train_val_datasets_at, lag_n, config, batch_size,
-                          num_epochs=40):
+                          num_epochs=40, if_log = False):
     
     losses_cv_horizon= []
     maes_cv_horizon = []
@@ -1394,6 +1394,10 @@ def cross_validation_LSTM_Horizon(model_fold, cv_train_val_ds_at, train_val_data
         for _, y_batch in val_cv_ds_at:
             val_y_cv_horizon.append(y_batch.numpy())
         val_y_cv_horizon = np.concatenate(val_y_cv_horizon, axis=0)
+
+        if if_log:
+            val_y_cv_horizon = np.power(2, val_y_cv_horizon)-1
+            val_pred_horizon = clip_and_inverse_log2_transform(val_pred_horizon)
 
         # compute rmse and r2 along the trajectory
         rmses_cv_horizon = [root_mean_squared_error(val_y_cv_horizon[:, i],val_pred_horizon[:, i]) for i in range(0, val_y_cv_horizon.shape[1])]
