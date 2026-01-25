@@ -922,7 +922,343 @@ def compute_recursive_predictions_fast_torch(
 
     preds = np.concatenate(preds_all, axis=0)
     trues = np.concatenate(trues_all, axis=0)
+
+
     return preds, trues
+
+
+def compute_recursive_predictions_fast_torch_training(
+    model,
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    config: Optional[FeatureConfig] = None,
+    batch_size: int = 128,
+    rolling: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Autoregressive recursive predictions that preserve autograd graph.
+    Only the minibatch inputs are moved to `dev` for the forward pass;
+    predictions are stored on `dev` and fed back into subsequent steps
+    so gradients flow through recursive predictions.
+
+    Returns torch tensors (preds, trues) on the model device.
+    """
+    config = config or FeatureConfig()
+
+    per_row_cols = config.time_varying + config.time_varying_no_target + config.static
+    n_tvt = len(config.time_varying)
+    n_other = len(config.time_varying_no_target)
+    n_static = len(config.static)
+
+    idx_twd_in_tvt = config.time_varying.index("twd")
+
+    # device for model tensors
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    preds_groups = []
+    trues_groups = []
+
+    for site in df.site_name.unique():
+        df_site = df.loc[df['site_name'] == site, :]
+        for sp in df_site['species'].unique():
+            df_group = (
+                df_site[df_site['species'] == sp]
+                .sort_values('ts', ascending=True)
+                .reset_index(drop=True)
+            )
+            n_sample = len(df_group)
+            window_len = 2 * feature_window_size + 1
+            n_windows = n_sample - 2 * feature_window_size - label_window_size - shift + 1
+            if n_windows <= 0:
+                continue
+
+            # keep full windows as numpy on CPU (do not push to GPU)
+            arr = df_group[per_row_cols].to_numpy(dtype=float)  # (n_sample, cols)
+            windows_np = np.stack([arr[i : i + window_len] for i in range(n_windows)], axis=0)
+
+            # Only move the twd column to device (we will update it with prediction tensors)
+            twd_col_np = windows_np[:, :, idx_twd_in_tvt]  # (n_windows, window_len)
+            twd_dev = torch.from_numpy(twd_col_np).float().to(dev)  # lives on dev, will be updated with prediction tensors
+
+            # Precompute index lists
+            idx_tvd = list(range(0, n_tvt))
+            idx_non_twd = [i for i in idx_tvd if i != idx_twd_in_tvt]
+            idx_other = list(range(n_tvt, n_tvt + n_other))
+            idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+            # determine steps
+            if rolling:
+                n_steps = label_window_size
+            else:
+                n_steps = feature_window_size + 1
+
+            # Prepare storage for this group
+            if rolling:
+                preds_group = torch.empty((n_windows, n_steps), device=dev, dtype=torch.float32)
+            else:
+                preds_group = torch.empty((n_windows,), device=dev, dtype=torch.float32)
+
+            # true labels (extracted from original windows_np) as torch on dev
+            # label indices used depend on step; for rolling we need first-step trues, for non-rolling final-step trues
+            # We'll compute trues_group when needed inside loop
+
+            # iterate recursive steps
+            for step in range(n_steps):
+                start = step
+                end = start + feature_window_size  # current index = end
+                label_start = step + feature_window_size + shift - 1
+                label_end = label_start + label_window_size
+
+                # For non-twd tv features we will slice from windows_np per-batch and move to device.
+                # For twd we will use slices from twd_dev which is on device and will contain predictions as we overwrite.
+
+                # batch over windows to avoid loading all inputs to device
+                for s in range(0, n_windows, batch_size):
+                    e = min(s + batch_size, n_windows)
+
+                    # non-twd features for the batch: (batch, feature_window_size, n_non_twd)
+                    if len(idx_non_twd) > 0:
+                        non_twd_np = windows_np[s:e, start:end, :][:, :, idx_non_twd]
+                        non_twd_t = torch.from_numpy(non_twd_np).float().to(dev)
+                    else:
+                        non_twd_t = torch.empty((e - s, feature_window_size, 0), device=dev, dtype=torch.float32)
+
+                    # twd slice for the batch: (batch, feature_window_size, 1)
+                    twd_t = twd_dev[s:e, start:end].unsqueeze(-1)  # already on dev
+
+                    # Reconstruct tv_b in original feature ordering (batch, feature_window_size, n_tvt)
+                    cols = []
+                    for col in idx_tvd:
+                        if col == idx_twd_in_tvt:
+                            cols.append(twd_t)
+                        else:
+                            pos = idx_non_twd.index(col)
+                            cols.append(non_twd_t[:, :, pos:pos+1])
+                    tv_b = torch.cat(cols, dim=2)  # (batch, feature_window_size, n_tvt)
+
+                    # other / static features (current day at index 'end')
+                    if n_other > 0:
+                        other_np = windows_np[s:e, end, :][:, idx_other]  # (batch, n_other)
+                        other_b = torch.from_numpy(other_np).float().to(dev)
+                    else:
+                        other_b = torch.empty((e - s, 0), device=dev, dtype=torch.float32)
+
+                    if n_static > 0:
+                        static_np = windows_np[s:e, end, :][:, idx_static]  # (batch, n_static)
+                        static_b = torch.from_numpy(static_np).float().to(dev)
+                    else:
+                        static_b = torch.empty((e - s, 0), device=dev, dtype=torch.float32)
+
+                    # forward through model (NO torch.no_grad()) so graph is preserved
+                    try:
+                        out = model(tv_b, other_b, static_b)
+                    except TypeError:
+                        out = model([tv_b, other_b, static_b])
+                    out = out.reshape(-1)  # (batch,)
+
+                    # write predictions into group storage for this step (keeps grad)
+                    if rolling:
+                        preds_group[s:e, step] = out
+                    else:
+                        # if final step, store predictions; otherwise will update twd_dev below
+                        if step == feature_window_size:
+                            preds_group[s:e] = out
+
+                    # update twd_dev for autoregressive feeding: write predicted values into the label position
+                    # This keeps the graph because `out` is a tensor on dev connected to model outputs
+                    if step < n_steps - 0:  # in both rolling and non-rolling we update for next step when applicable
+                        # label position to update (absolute position inside window_len)
+                        if label_start >= 0 and label_start < window_len:
+                            twd_dev[s:e, label_start] = out
+                        # else: out of bounds (shouldn't normally happen), skip
+
+                # collect true labels where appropriate (torch on dev)
+                if rolling and step == 0:
+                    true_np = windows_np[:, label_start:label_end, idx_twd_in_tvt]  # (n_windows, label_window_size)
+                    trues_group = torch.from_numpy(true_np).float().to(dev)
+                if (not rolling) and (step == feature_window_size):
+                    true_np = windows_np[:, label_start:label_end, idx_twd_in_tvt]  # (n_windows, label_window_size)
+                    trues_group = torch.from_numpy(true_np).float().to(dev)
+                    # if label_window_size == 1, flatten to (n_windows,)
+                    if label_window_size == 1:
+                        trues_group = trues_group.reshape(-1)
+
+            # after steps for this group, append to global lists
+            preds_groups.append(preds_group)
+            trues_groups.append(trues_group)
+
+    # concatenate across groups
+    if not preds_groups:
+        return torch.empty((0,), device=dev), torch.empty((0,), device=dev)
+
+    if rolling:
+        preds = torch.cat(preds_groups, dim=0)  # shape (total_windows, n_steps)
+        trues = torch.cat(trues_groups, dim=0)  # shape (total_windows, label_window_size)
+    else:
+        preds = torch.cat(preds_groups, dim=0)  # shape (total_windows,)
+        trues = torch.cat(trues_groups, dim=0)  # shape (total_windows,) or (total_windows, label_window_size)
+
+    return preds, trues
+
+
+# def compute_recursive_predictions_fast_torch_training(
+#     model,
+#     df: pd.DataFrame,
+#     feature_window_size: int,
+#     label_window_size: int = 1,
+#     shift: int = 1,
+#     config: Optional[FeatureConfig] = None,
+#     batch_size: int = 128,
+#     rolling: bool = False
+# ) -> Tuple[np.ndarray, np.ndarray]:
+#     """
+#     Vectorized autoregressive recursive predictions for a PyTorch model.
+    
+#     The model is expected to accept three inputs: 
+#       [past_dynamic (N, timesteps, n_tvt), current_day_exog (N, n_other), static (N, n_static)]
+    
+#     Args:
+#         model: PyTorch model with signature (past_dynamic, current_day_exog, static)
+#         df: DataFrame with time series data grouped by site_name and species
+#         feature_window_size: Number of past timesteps used as input
+#         label_window_size: Number of future timesteps to predict (only used when rolling=True)
+#         shift: Offset between end of input window and start of label window
+#         config: Feature configuration
+#         batch_size: Batch size for inference
+#         rolling: If False, collect only the final prediction after feature_window_size 
+#                  recursive steps (tests long-horizon AR capability).
+#                  If True, collect predictions at each step up to label_window_size
+#                  (tests short-horizon rolling forecasts).
+    
+#     Returns:
+#         (preds, trues) as numpy arrays.
+#     """
+#     config = config or FeatureConfig()
+#     preds_all = []
+#     trues_all = []
+
+#     per_row_cols = config.time_varying + config.time_varying_no_target + config.static
+#     n_tvt = len(config.time_varying)
+#     n_other = len(config.time_varying_no_target)
+#     n_static = len(config.static)
+
+#     # index of twd inside the time_varying block
+#     idx_twd_in_tvt = config.time_varying.index("twd")
+
+#     # Determine device from model params once (not per step)
+#     try:
+#         dev = next(model.parameters()).device
+#     except StopIteration:
+#         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#     for site in df.site_name.unique():
+#         df_site = df.loc[df['site_name'] == site, :]
+#         for sp in df_site['species'].unique():
+#             df_group = (
+#                 df_site[df_site['species'] == sp]
+#                 .sort_values('ts', ascending=True)
+#                 .reset_index(drop=True)
+#             )
+#             n_sample = len(df_group)
+#             window_len = 2 * feature_window_size + 1
+#             n_windows = n_sample - 2*feature_window_size - label_window_size - shift + 1
+#             if n_windows <= 0:
+#                 continue
+
+#             # numpy array (n_sample, cols)
+#             arr = df_group[per_row_cols].to_numpy(dtype=float)
+
+#             # sliding windows: (n_windows, window_len, cols)
+#             windows = np.stack([arr[i : i + window_len] for i in range(n_windows)], axis=0)
+
+#             # column indices inside per-row block
+#             idx_tvd = list(range(0, n_tvt))
+#             idx_other = list(range(n_tvt, n_tvt + n_other))
+#             idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+#             # Determine number of recursive steps
+#             if rolling:
+#                 # Rolling mode: predict label_window_size steps, collecting each
+#                 n_steps = label_window_size
+#                 y_pred_steps = []
+#             else:
+#                 # Standard mode: recurse feature_window_size times, collect only final
+#                 n_steps = feature_window_size + 1
+
+#             # recursive steps
+#             for step in range(n_steps):
+#                 start = step
+#                 end = start + feature_window_size  # exclusive end for slicing past lags; current index = end
+
+#                 # keep 3D dynamic block: (n_windows, feature_window_size, n_tvt)
+#                 tv_block = windows[:, start:end, :][:, :, idx_tvd]
+
+#                 # current-day non-target and static features (at index 'end')
+#                 other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
+#                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
+
+#                 # predict in batch using a PyTorch model
+#                 y_preds_chunks = []
+
+#                 n_all = tv_block.shape[0]
+#                 for s in range(0, n_all, batch_size):
+#                     e = min(s + batch_size, n_all)
+#                     tv_b = torch.from_numpy(tv_block[s:e]).float().to(dev)
+#                     other_b = torch.from_numpy(other_feats[s:e]).float().to(dev) if n_other > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
+#                     static_b = torch.from_numpy(static_feats[s:e]).float().to(dev) if n_static > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
+#                     try:
+#                         out = model(tv_b, other_b, static_b)
+#                     except TypeError:
+#                         out = model([tv_b, other_b, static_b])
+#                     out = out.reshape(-1).cpu().numpy()
+#                     y_preds_chunks.append(out)
+
+#                 y_batch = np.concatenate(y_preds_chunks, axis=0) if y_preds_chunks else np.array([])
+
+#                 # label indices
+#                 label_start = step + feature_window_size + shift - 1
+#                 label_end = label_start + label_window_size 
+
+#                 if rolling:
+
+#                     y_pred_steps.append(y_batch)
+#                     # Update for next step
+#                     windows[:, label_start, idx_twd_in_tvt] = y_batch
+#                     # Collect prediction at each step
+#                     if step==0:
+#                         true_labels = windows[:, label_start:label_end, idx_twd_in_tvt]
+#                         trues_all.append(true_labels)
+        
+#                     if step == label_window_size -1:
+#                         y_pred_steps = np.stack(y_pred_steps, axis = 1)
+#                         preds_all.append(y_pred_steps)
+                
+#                 else:
+#                     if step == feature_window_size:
+#                         # Final step: collect predictions
+#                         if label_window_size == 1:
+#                             true_labels = windows[:, label_start, idx_twd_in_tvt].reshape(-1)
+#                         else:
+#                             true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1, label_window_size)
+#                         preds_all.append(y_batch)
+#                         trues_all.append(true_labels)
+#                     else:
+#                         # Intermediate step: update autoregressive twd for next step
+#                         windows[:, label_start, idx_twd_in_tvt] = y_batch
+
+#     if len(preds_all) == 0:
+#         return np.array([]), np.array([])
+
+#     preds = np.concatenate(preds_all, axis=0)
+#     trues = np.concatenate(trues_all, axis=0)
+
+
+#     return preds, trues
 
 
 def build_autoregressive_training_data_fast_LSTM(
