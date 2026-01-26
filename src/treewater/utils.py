@@ -2373,6 +2373,208 @@ def train_transformer_scheduled(
     return model, history
 
 
+def train_one_epoch_rolling_loss(model, epoch_index, train_loader, train_df_at, loss_fn, optimizer, 
+                                config,
+                                 device=None, log_every=100,
+                                 ):
+    device = device or next(model.parameters()).device
+    running_loss = 0.0
+    sse = 0.0
+    n_samples = 0
+    n_batches = 0
+
+    model.train()
+    for i, batch in enumerate(train_loader):
+        X_dyn, X_day, X_static, labels, indexes = batch
+        indexes = indexes.numpy()
+        # X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device); 
+        labels = labels.to(device)
+
+        train_df_at_batch = train_df_at.iloc[indexes[0,0]:indexes[-1, -1]+1, ]
+        optimizer.zero_grad()
+        
+        outputs_horizon, targets_horizon = compute_recursive_predictions_fast_torch_training(
+            model,
+            train_df_at_batch,
+            feature_window_size=X_dyn.shape[1],
+            label_window_size=labels.shape[1],
+            shift=1,
+            batch_size = 256,
+            config=config,
+            rolling = True
+        )
+        
+        # Skip if no valid windows were created
+        if outputs_horizon.shape[0] == 0:
+            continue
+            
+        # Skip if no valid windows were created
+        if outputs_horizon.shape[0] == 0:
+            continue
+        
+        # Ensure tensors are on the correct device and maintain gradients
+        # DO NOT use torch.tensor() as it breaks the computation graph
+        if not isinstance(outputs_horizon, torch.Tensor):
+            outputs_horizon = torch.as_tensor(outputs_horizon, dtype=torch.float32, device=device)
+        else:
+            outputs_horizon = outputs_horizon.to(device)
+            
+        if not isinstance(targets_horizon, torch.Tensor):
+            targets_horizon = torch.as_tensor(targets_horizon, dtype=torch.float32, device=device)
+        else:
+            targets_horizon = targets_horizon.to(device)
+        
+        # Ensure tensors are 2D for loss function
+        if outputs_horizon.dim() == 1:
+            outputs_horizon = outputs_horizon.unsqueeze(0)
+        if targets_horizon.dim() == 1:
+            targets_horizon = targets_horizon.unsqueeze(0)
+            
+            
+        loss = loss_fn(outputs_horizon, targets_horizon)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += float(loss.item())
+        batch_sse = float(F.mse_loss(outputs_horizon, targets_horizon, reduction='sum').item())
+        sse += batch_sse
+        n_samples += targets_horizon.numel()
+        n_batches += 1
+
+        if (i + 1) % log_every == 0:
+            print(f'  batch {i+1} loss: {running_loss / n_batches:.4f}')
+
+    avg_batch_loss = running_loss / n_batches if n_batches > 0 else float("nan")
+    train_rmse = math.sqrt(sse / n_samples) if n_samples > 0 else float("nan")
+    return avg_batch_loss, train_rmse
+
+
+def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, val_df, loss_fn, optimizer, config, n_epochs=50, 
+device=None):
+    device = device or next(model.parameters()).device
+    # best_val_rmse = float("inf")
+    # best_model_state = None
+    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
+
+    model.to(device)
+    for epoch in range(n_epochs):
+        print(f'Epoch {epoch + 1}/{n_epochs}')
+        avg_loss, train_rmse = train_one_epoch_rolling_loss(model, epoch, train_loader, train_df, loss_fn, optimizer,
+                                                        config,
+                                           device=device, log_every=100)
+        # print(f'  Train Loss: {avg_loss:.4f}, Train RMSE: {train_rmse:.4f}')
+
+        # validation
+        model.eval()
+        val_sse = 0.0
+        val_batches = 0
+        val_n = 0
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for i, (X_dyn_val, X_day_val, X_static_val, vlabels, v_indexes) in enumerate(val_loader):
+                v_indexes = v_indexes.numpy()
+                voutputs_horizon, vtargets_horizon = compute_recursive_predictions_fast_torch_training(
+                    model,
+                    val_df.iloc[v_indexes[0,0]:v_indexes[-1, -1]+1, ],
+                    feature_window_size=X_dyn_val.shape[1],
+                    label_window_size=vlabels.shape[1],
+                    shift=1,
+                    batch_size = 256,
+                    config=config,
+                    rolling = True
+                )
+                voutputs_horizon = torch.as_tensor(voutputs_horizon).to(device)
+                vtargets_horizon = torch.as_tensor(vtargets_horizon).to(device)
+                vloss = loss_fn(voutputs_horizon, vtargets_horizon.to(device))
+                val_loss_sum += vloss.item()
+                val_sse += F.mse_loss(voutputs_horizon, vtargets_horizon.to(device), reduction='sum').item()
+                val_n += vtargets_horizon.numel()
+
+
+        avg_vloss = val_loss_sum  / (i + 1)
+        avg_vloss_f = avg_vloss.item() if hasattr(avg_vloss, "item") else float(avg_vloss)
+
+        val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
+        print(f'Train loss:{avg_loss:.4f}, Train RMSE:{train_rmse:.4f}, Val loss:{avg_vloss:.4f}, Val RMSE:{val_rmse:.4f}')
+        # Log the running loss averaged per batch
+        # for both training and validation
+
+        history["train_loss"].append(float(avg_loss))
+        history["val_loss"].append(avg_vloss_f)
+        history["train_rmse"].append(train_rmse)
+        history["val_rmse"].append(val_rmse)
+    # for cross validation no saving model 
+    return model, history
+
+
+def cross_validate_transformer_rolling_loss(model_factory, cv_train_val_ds_at, train_val_datasets_at, loss_fn, optimizer_class,lag_n,
+                                config, batch_size, lr=1e-3/2, n_epochs=50, 
+                                device=None,
+                                if_log = False):
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    historys_cv_at = []
+
+    for fold, (train_loader, val_loader) in enumerate(cv_train_val_ds_at):
+        print(f'Starting fold {fold + 1}/{len(cv_train_val_ds_at)}')
+        model_fold = model_factory().to(device) if device else model_factory()
+        optimizer = optimizer_class(model_fold.parameters(), lr=lr)
+        train_cv_df_at = train_val_datasets_at[fold][0]
+        val_cv_df_at = train_val_datasets_at[fold][1]
+
+
+        model_fold, history = train_transformer_rolling_loss(model_fold, train_loader, val_loader, train_cv_df_at, val_cv_df_at, loss_fn, optimizer, config, n_epochs=n_epochs, device=device)
+        model_fold.eval()
+        val_y_cv_1d_at = []
+        val_preds_cv_1d_at = []
+        with torch.no_grad():
+            for batch in val_loader:
+                X_dyn, X_day, X_static, labels, _ = batch
+                X_dyn = X_dyn.to(device); X_day = X_day.to(device); X_static = X_static.to(device)
+                outputs = model_fold(X_dyn, X_day, X_static)
+                val_y_cv_1d_at.append(labels.cpu().numpy()[:,0]) # label window size is 7 but we took the first day
+                val_preds_cv_1d_at.append(outputs.cpu().numpy())
+
+        val_y_cv_1d_at = np.concatenate(val_y_cv_1d_at, axis=0)
+        val_preds_cv_1d_at = np.concatenate(val_preds_cv_1d_at, axis=0)
+        
+
+        # recursive evaluation (ensure compute_recursive_predictions_fast_torch expects a model on CPU or device you pass)
+        
+        val_pred_recursive_at, val_true_recursive_at = compute_recursive_predictions_fast_torch(
+            model_fold, val_cv_df_at, feature_window_size=lag_n, label_window_size=1, shift=1,
+            config=config, batch_size=batch_size) # do not change label window size here since feature window size is the same
+
+        if if_log == True:
+          val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+          val_true_recursive_at = np.exp2(val_true_recursive_at)-1
+          
+          val_preds_cv_1d_at = clip_and_inverse_log2_transform(val_preds_cv_1d_at)
+          val_y_cv_1d_at = np.exp2(val_y_cv_1d_at)-1
+
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_preds_cv_1d_at)
+        rmse_recursive_at = root_mean_squared_error(val_true_recursive_at, val_pred_recursive_at)
+        r2_1day_at = r2_score(val_y_cv_1d_at, val_preds_cv_1d_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+
+        rmses_cv_at.append(rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+        historys_cv_at.append(history)
+
+    return rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at, historys_cv_at
+
+
+
+
+
 
 
 def cross_validate_transformer(model_factory, cv_train_val_ds_at, train_val_datasets_at, loss_fn, optimizer_class,lag_n,
@@ -2492,6 +2694,7 @@ def cross_validate_transformer_horizon(model_factory, cv_train_val_ds_at, train_
         historys_cv_horizon.append(history)
 
     return rmses_cv_horizon, r2s_cv_horizon, y_trues_cv_horizon, y_preds_cv_horizon, historys_cv_horizon
+
 
 
 
