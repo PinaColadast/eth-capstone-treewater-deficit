@@ -313,7 +313,10 @@ def get_dataset_NN_torch(
     tv_block_t = torch.from_numpy(tv_block_arr).float()
     pred_day_other_feats_t = torch.from_numpy(pred_day_other_feats_arr).float()
     static_feats_t = torch.from_numpy(static_feats_arr).float()
-    labels_t = torch.from_numpy(labels_arr).float()
+    if label_window_size == 1:
+        labels_t = torch.from_numpy(labels_arr.reshape(-1)).float()
+    else:
+        labels_t = torch.from_numpy(labels_arr).float()
 
     return tv_block_t, pred_day_other_feats_t, static_feats_t, labels_t
 
