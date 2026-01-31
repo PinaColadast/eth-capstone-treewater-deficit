@@ -2327,7 +2327,10 @@ def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, va
     device = device or next(model.parameters()).device
     # best_val_rmse = float("inf")
     # best_model_state = None
-    history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
+    if scheduled:
+        history =  {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": [], "p_tf":[]}
+    else:
+        history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
     best_loss = 1_000_000
 
     model.to(device)
@@ -2429,7 +2432,7 @@ def cross_validate_transformer_rolling_loss(model_factory, cv_train_val_ds_at, t
                 p0 = 0.8,
                 p_min = 0,
                 frac_decay = 0.65,
-                epoch_per_step = 8, warmup_epochs = 1)
+                epoch_per_step = 8, warmup_epochs = 3)
         else:
             model_fold, history = train_transformer_rolling_loss(model_fold, train_loader, val_loader, train_cv_df_at, val_cv_df_at, loss_fn, optimizer, config, n_epochs=n_epochs, device=device)
         model_fold.eval()
