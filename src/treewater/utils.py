@@ -1,3 +1,4 @@
+import os
 import math
 import copy
 
@@ -1512,9 +1513,9 @@ def teacher_forcing_prob_stepwise(
     else:
         # linear decay between p0 and p_min
         num_steps = decay_epochs //epoch_per_step
-        step_size = np.maximum((p0 - p_min) / num_steps, step_size)
+        step_size = max((p0 - p_min) / num_steps, step_size)
         t = (epoch - decay_start_epoch) // epoch_per_step
-        p_t = np.maximum(p_min, p0 - (t+1)* step_size)
+        p_t = max(p_min, p0 - (t+1)* step_size)
         return p_t
 
 
@@ -2319,18 +2320,22 @@ def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, va
                                      p0 = 0.7,
                                      p_min = 0.1, warmup_epochs=3, frac_decay = 0.9, 
                                     epoch_per_step = 10,
+                                    return_best_model = False,
+                                    model_output_dir = None,
                                      device=None):
+                                     
     device = device or next(model.parameters()).device
     # best_val_rmse = float("inf")
     # best_model_state = None
     history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": []}
+    best_loss = 1_000_000
 
     model.to(device)
     for epoch in range(n_epochs):
         print(f'Epoch {epoch + 1}/{n_epochs}')
         if scheduled:
             p_tf = teacher_forcing_prob_stepwise(epoch, n_epochs, p0=p0, p_min=p_min, warmup_epochs=warmup_epochs, frac_decay=frac_decay,
-            step_size = epoch_per_step)
+            epoch_per_step = epoch_per_step)
             avg_loss, train_rmse = train_one_epoch_rolling_loss(model, epoch, train_loader, train_df, loss_fn, optimizer,
             config, device, scheduled = scheduled, p_tf = p_tf, log_every=100)
         else:
@@ -2378,6 +2383,14 @@ def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, va
         history["val_loss"].append(avg_vloss_f)
         history["train_rmse"].append(train_rmse)
         history["val_rmse"].append(val_rmse)
+
+        if return_best_model:
+            if avg_vloss < best_loss:
+                best_loss = avg_vloss
+                model_path = f'{model_output_dir}_{epoch}'
+    torch.save(model.state_dict(), model_path)
+    if return_best_model:
+        return model, history, model_path
     # for cross validation no saving model 
     return model, history
 
@@ -2385,7 +2398,9 @@ def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, va
 def cross_validate_transformer_rolling_loss(model_factory, cv_train_val_ds_at, train_val_datasets_at, loss_fn, optimizer_class,lag_n,
                                 config, batch_size, lr=1e-3/2, n_epochs=50, 
                                 device=None,
-                                if_log = False):
+                                if_log = False,
+                                scheduled = False
+                                ):
     rmses_cv_at = []
     rmses_cv_1d_at = []
     r2s_cv_1d_at = []
@@ -2401,8 +2416,17 @@ def cross_validate_transformer_rolling_loss(model_factory, cv_train_val_ds_at, t
         train_cv_df_at = train_val_datasets_at[fold][0]
         val_cv_df_at = train_val_datasets_at[fold][1]
 
-
-        model_fold, history = train_transformer_rolling_loss(model_fold, train_loader, val_loader, train_cv_df_at, val_cv_df_at, loss_fn, optimizer, config, n_epochs=n_epochs, device=device)
+        if scheduled:
+            model_fold, history = train_transformer_rolling_loss(
+                model_fold, train_loader, val_loader, train_cv_df_at, val_cv_df_at,
+                loss_fn, optimizer, config,n_epochs = n_epochs, device = device,
+                scheduled = scheduled,
+                p0 = 0.7,
+                p_min = 0,
+                frac_decay = 0.65,
+                epoch_per_step = 8, warmup_epochs = 1)
+        else:
+            model_fold, history = train_transformer_rolling_loss(model_fold, train_loader, val_loader, train_cv_df_at, val_cv_df_at, loss_fn, optimizer, config, n_epochs=n_epochs, device=device)
         model_fold.eval()
         val_y_cv_1d_at = []
         val_preds_cv_1d_at = []
