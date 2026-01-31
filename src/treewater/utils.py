@@ -2377,7 +2377,7 @@ def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, va
         val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
         if scheduled:
             print(f'Train loss:{avg_loss:.4f}, Train RMSE:{train_rmse:.4f}, Val loss:{avg_vloss:.4f}, Val RMSE:{val_rmse:.4f}, p_tf:{p_tf:.4f}')
-            hisotory["p_tf"].append(float(p_tf))
+            history["p_tf"].append(float(p_tf))
         else:
             print(f'Train loss:{avg_loss:.4f}, Train RMSE:{train_rmse:.4f}, Val loss:{avg_vloss:.4f}, Val RMSE:{val_rmse:.4f}')
         # Log the running loss averaged per batch
