@@ -2421,7 +2421,7 @@ def cross_validate_transformer_rolling_loss(model_factory, cv_train_val_ds_at, t
                 model_fold, train_loader, val_loader, train_cv_df_at, val_cv_df_at,
                 loss_fn, optimizer, config,n_epochs = n_epochs, device = device,
                 scheduled = scheduled,
-                p0 = 0.7,
+                p0 = 0.8,
                 p_min = 0,
                 frac_decay = 0.65,
                 epoch_per_step = 8, warmup_epochs = 1)
