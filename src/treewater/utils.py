@@ -2384,12 +2384,13 @@ def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, va
         history["train_rmse"].append(train_rmse)
         history["val_rmse"].append(val_rmse)
 
-        if return_best_model:
-            if avg_vloss < best_loss:
-                best_loss = avg_vloss
-                model_path = f'{model_output_dir}_{epoch}'
-    torch.save(model.state_dict(), model_path)
+ 
+        if avg_vloss < best_loss:
+            best_loss = avg_vloss
+            model_path = f'{model_output_dir}_{epoch}'
+    
     if return_best_model:
+        torch.save(model.state_dict(), model_path)
         return model, history, model_path
     # for cross validation no saving model 
     return model, history
