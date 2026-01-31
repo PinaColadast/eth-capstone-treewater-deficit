@@ -939,7 +939,9 @@ def compute_recursive_predictions_fast_torch_training(
     shift: int = 1,
     config: Optional[FeatureConfig] = None,
     batch_size: int = 128,
-    rolling: bool = False
+    rolling: bool = False,
+    scheduled: bool = False,
+    p_tf = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Autoregressive recursive predictions that preserve autograd graph.
@@ -976,8 +978,8 @@ def compute_recursive_predictions_fast_torch_training(
                 .reset_index(drop=True)
             )
             n_sample = len(df_group)
-            window_len = 2 * feature_window_size + 1
-            n_windows = n_sample - 2 * feature_window_size - label_window_size - shift + 1
+            window_len =2*feature_window_size+ 1
+            n_windows = n_sample - feature_window_size - label_window_size - shift + 1
             if n_windows <= 0:
                 continue
 
@@ -1078,6 +1080,13 @@ def compute_recursive_predictions_fast_torch_training(
                     if step < n_steps - 0:  # in both rolling and non-rolling we update for next step when applicable
                         # label position to update (absolute position inside window_len)
                         if label_start >= 0 and label_start < window_len:
+                            if scheduled:
+                                y_true_b = torch.from_numpy(windows_np[s:e, label_start, idx_twd_in_tvt]).float().to(dev)
+                                # mask per sample: True -> use ground truth, False -> use prediction
+                                #  (teacher_forcing_prob can be a float, or you can compute a schedule per step/epoch)
+                                use_truth = (torch.rand_like(out) < p_tf)
+                                out = torch.where(use_truth, y_true_b, out)
+
                             twd_dev[s:e, label_start] = out
                         # else: out of bounds (shouldn't normally happen), skip
 
@@ -1110,159 +1119,6 @@ def compute_recursive_predictions_fast_torch_training(
     return preds, trues
 
 
-# def compute_recursive_predictions_fast_torch_training(
-#     model,
-#     df: pd.DataFrame,
-#     feature_window_size: int,
-#     label_window_size: int = 1,
-#     shift: int = 1,
-#     config: Optional[FeatureConfig] = None,
-#     batch_size: int = 128,
-#     rolling: bool = False
-# ) -> Tuple[np.ndarray, np.ndarray]:
-#     """
-#     Vectorized autoregressive recursive predictions for a PyTorch model.
-    
-#     The model is expected to accept three inputs: 
-#       [past_dynamic (N, timesteps, n_tvt), current_day_exog (N, n_other), static (N, n_static)]
-    
-#     Args:
-#         model: PyTorch model with signature (past_dynamic, current_day_exog, static)
-#         df: DataFrame with time series data grouped by site_name and species
-#         feature_window_size: Number of past timesteps used as input
-#         label_window_size: Number of future timesteps to predict (only used when rolling=True)
-#         shift: Offset between end of input window and start of label window
-#         config: Feature configuration
-#         batch_size: Batch size for inference
-#         rolling: If False, collect only the final prediction after feature_window_size 
-#                  recursive steps (tests long-horizon AR capability).
-#                  If True, collect predictions at each step up to label_window_size
-#                  (tests short-horizon rolling forecasts).
-    
-#     Returns:
-#         (preds, trues) as numpy arrays.
-#     """
-#     config = config or FeatureConfig()
-#     preds_all = []
-#     trues_all = []
-
-#     per_row_cols = config.time_varying + config.time_varying_no_target + config.static
-#     n_tvt = len(config.time_varying)
-#     n_other = len(config.time_varying_no_target)
-#     n_static = len(config.static)
-
-#     # index of twd inside the time_varying block
-#     idx_twd_in_tvt = config.time_varying.index("twd")
-
-#     # Determine device from model params once (not per step)
-#     try:
-#         dev = next(model.parameters()).device
-#     except StopIteration:
-#         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-#     for site in df.site_name.unique():
-#         df_site = df.loc[df['site_name'] == site, :]
-#         for sp in df_site['species'].unique():
-#             df_group = (
-#                 df_site[df_site['species'] == sp]
-#                 .sort_values('ts', ascending=True)
-#                 .reset_index(drop=True)
-#             )
-#             n_sample = len(df_group)
-#             window_len = 2 * feature_window_size + 1
-#             n_windows = n_sample - 2*feature_window_size - label_window_size - shift + 1
-#             if n_windows <= 0:
-#                 continue
-
-#             # numpy array (n_sample, cols)
-#             arr = df_group[per_row_cols].to_numpy(dtype=float)
-
-#             # sliding windows: (n_windows, window_len, cols)
-#             windows = np.stack([arr[i : i + window_len] for i in range(n_windows)], axis=0)
-
-#             # column indices inside per-row block
-#             idx_tvd = list(range(0, n_tvt))
-#             idx_other = list(range(n_tvt, n_tvt + n_other))
-#             idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
-
-#             # Determine number of recursive steps
-#             if rolling:
-#                 # Rolling mode: predict label_window_size steps, collecting each
-#                 n_steps = label_window_size
-#                 y_pred_steps = []
-#             else:
-#                 # Standard mode: recurse feature_window_size times, collect only final
-#                 n_steps = feature_window_size + 1
-
-#             # recursive steps
-#             for step in range(n_steps):
-#                 start = step
-#                 end = start + feature_window_size  # exclusive end for slicing past lags; current index = end
-
-#                 # keep 3D dynamic block: (n_windows, feature_window_size, n_tvt)
-#                 tv_block = windows[:, start:end, :][:, :, idx_tvd]
-
-#                 # current-day non-target and static features (at index 'end')
-#                 other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
-#                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
-
-#                 # predict in batch using a PyTorch model
-#                 y_preds_chunks = []
-
-#                 n_all = tv_block.shape[0]
-#                 for s in range(0, n_all, batch_size):
-#                     e = min(s + batch_size, n_all)
-#                     tv_b = torch.from_numpy(tv_block[s:e]).float().to(dev)
-#                     other_b = torch.from_numpy(other_feats[s:e]).float().to(dev) if n_other > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
-#                     static_b = torch.from_numpy(static_feats[s:e]).float().to(dev) if n_static > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
-#                     try:
-#                         out = model(tv_b, other_b, static_b)
-#                     except TypeError:
-#                         out = model([tv_b, other_b, static_b])
-#                     out = out.reshape(-1).cpu().numpy()
-#                     y_preds_chunks.append(out)
-
-#                 y_batch = np.concatenate(y_preds_chunks, axis=0) if y_preds_chunks else np.array([])
-
-#                 # label indices
-#                 label_start = step + feature_window_size + shift - 1
-#                 label_end = label_start + label_window_size 
-
-#                 if rolling:
-
-#                     y_pred_steps.append(y_batch)
-#                     # Update for next step
-#                     windows[:, label_start, idx_twd_in_tvt] = y_batch
-#                     # Collect prediction at each step
-#                     if step==0:
-#                         true_labels = windows[:, label_start:label_end, idx_twd_in_tvt]
-#                         trues_all.append(true_labels)
-        
-#                     if step == label_window_size -1:
-#                         y_pred_steps = np.stack(y_pred_steps, axis = 1)
-#                         preds_all.append(y_pred_steps)
-                
-#                 else:
-#                     if step == feature_window_size:
-#                         # Final step: collect predictions
-#                         if label_window_size == 1:
-#                             true_labels = windows[:, label_start, idx_twd_in_tvt].reshape(-1)
-#                         else:
-#                             true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1, label_window_size)
-#                         preds_all.append(y_batch)
-#                         trues_all.append(true_labels)
-#                     else:
-#                         # Intermediate step: update autoregressive twd for next step
-#                         windows[:, label_start, idx_twd_in_tvt] = y_batch
-
-#     if len(preds_all) == 0:
-#         return np.array([]), np.array([])
-
-#     preds = np.concatenate(preds_all, axis=0)
-#     trues = np.concatenate(trues_all, axis=0)
-
-
-#     return preds, trues
 
 
 def build_autoregressive_training_data_fast_LSTM(
@@ -2380,6 +2236,8 @@ def train_transformer_scheduled(
 def train_one_epoch_rolling_loss(model, epoch_index, train_loader, train_df_at, loss_fn, optimizer, 
                                 config,
                                  device=None, log_every=100,
+                                 scheduled = False,
+                                 p_tf = None
                                  ):
     device = device or next(model.parameters()).device
     running_loss = 0.0
@@ -2397,6 +2255,7 @@ def train_one_epoch_rolling_loss(model, epoch_index, train_loader, train_df_at, 
         train_df_at_batch = train_df_at.iloc[indexes[0,0]:indexes[-1, -1]+1, ]
         optimizer.zero_grad()
         
+    
         outputs_horizon, targets_horizon = compute_recursive_predictions_fast_torch_training(
             model,
             train_df_at_batch,
@@ -2405,7 +2264,9 @@ def train_one_epoch_rolling_loss(model, epoch_index, train_loader, train_df_at, 
             shift=1,
             batch_size = 256,
             config=config,
-            rolling = True
+            rolling = True,
+            scheduled = scheduled,
+            p_tf = p_tf
         )
         
         # Skip if no valid windows were created
@@ -2453,8 +2314,12 @@ def train_one_epoch_rolling_loss(model, epoch_index, train_loader, train_df_at, 
     return avg_batch_loss, train_rmse
 
 
-def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, val_df, loss_fn, optimizer, config, n_epochs=50, 
-device=None):
+def train_transformer_rolling_loss(model, train_loader, val_loader, train_df, val_df, loss_fn,
+                                     optimizer, config, n_epochs=50, scheduled = False,
+                                     p0 = 0.7,
+                                     p_min = 0.1, warmup_epochs=3, frac_decay = 0.9, 
+                                    epoch_per_step = 10,
+                                     device=None):
     device = device or next(model.parameters()).device
     # best_val_rmse = float("inf")
     # best_model_state = None
@@ -2463,7 +2328,13 @@ device=None):
     model.to(device)
     for epoch in range(n_epochs):
         print(f'Epoch {epoch + 1}/{n_epochs}')
-        avg_loss, train_rmse = train_one_epoch_rolling_loss(model, epoch, train_loader, train_df, loss_fn, optimizer,
+        if scheduled:
+            p_tf = teacher_forcing_prob_stepwise(epoch, n_epochs, p0=p0, p_min=p_min, warmup_epochs=warmup_epochs, frac_decay=frac_decay,
+            step_size = epoch_per_step)
+            avg_loss, train_rmse = train_one_epoch_rolling_loss(model, epoch, train_loader, train_df, loss_fn, optimizer,
+            config, device, scheduled = scheduled, p_tf = p_tf, log_every=100)
+        else:
+            avg_loss, train_rmse = train_one_epoch_rolling_loss(model, epoch, train_loader, train_df, loss_fn, optimizer,
                                                         config,
                                            device=device, log_every=100)
         # print(f'  Train Loss: {avg_loss:.4f}, Train RMSE: {train_rmse:.4f}')
@@ -2499,7 +2370,7 @@ device=None):
         avg_vloss_f = avg_vloss.item() if hasattr(avg_vloss, "item") else float(avg_vloss)
 
         val_rmse = math.sqrt(val_sse / val_n) if val_n > 0 else float("nan")
-        print(f'Train loss:{avg_loss:.4f}, Train RMSE:{train_rmse:.4f}, Val loss:{avg_vloss:.4f}, Val RMSE:{val_rmse:.4f}')
+        print(f'Train loss:{avg_loss:.4f}, Train RMSE:{train_rmse:.4f}, Val loss:{avg_vloss:.4f}, Val RMSE:{val_rmse:.4f}, p_tf:{p_tf:.4f}')
         # Log the running loss averaged per batch
         # for both training and validation
 
