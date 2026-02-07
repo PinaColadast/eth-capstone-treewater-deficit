@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_squared_error, root_mean_squared_error
+from sklearn.linear_model import Ridge, RidgeCV
 
 
 
@@ -767,6 +768,116 @@ def compute_recursive_predictions_fast_LSTM(
     preds = np.concatenate(preds_all, axis=0)
     trues = np.concatenate(trues_all, axis=0)
     return preds, trues
+
+
+def compute_recursive_predictions_fast_rollout(
+    model,
+    df: pd.DataFrame,
+    feature_window_size: int,
+    label_window_size: int = 1,
+    shift: int = 1,
+    config: Optional[FeatureConfig] = None,
+    batch_size: int = 64,
+    tensor = True
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized autoregressive recursive predictions.
+    - Builds sliding windows per (site, species) once.
+    - Predicts in batches: one model.predict call per recursion step across all windows.
+    - Updates the target inside the windows with predicted values so subsequent steps use preds.
+    Returns (preds, trues) as 1D numpy arrays (matching original function semantics).
+    """
+    config = config or FeatureConfig()
+    preds_all = []
+    trues_all = []
+
+    preds_rollout_all = []
+    trues_rollout_all = []
+
+    per_row_cols = config.time_varying + config.time_varying_no_target+ config.static
+    n_tvt = len(config.time_varying)
+    n_other = len(config.time_varying_no_target)
+    n_static = len(config.static)
+
+    # index of twd inside the time_varying block
+    idx_twd_in_tvt = config.time_varying.index("twd")
+
+    for site in df.site_name.unique():
+        df_site = df.loc[df['site_name'] == site, :]
+        for sp in df_site['species'].unique():
+            df_group = (
+                df_site[df_site['species'] == sp]
+                .sort_values('ts', ascending=True)
+                .reset_index(drop=True)
+            )
+            n_sample = len(df_group)
+            window_len = 2 * feature_window_size + 1 
+            n_windows = n_sample - 2*feature_window_size - label_window_size - shift + 1
+            if n_windows <= 0:
+                continue
+
+            # convert to numpy once
+            arr = df_group[per_row_cols].to_numpy(dtype=float)  # shape (n_sample, cols)
+
+            # build sliding windows: shape (n_windows, window_len, cols)
+            windows = np.stack([arr[i : i + window_len] for i in range(n_windows)], axis=0)
+
+            # column indices inside per-row block
+            idx_tvd = list(range(0, n_tvt))
+            idx_other = list(range(n_tvt, n_tvt + n_other))
+            idx_static = list(range(n_tvt + n_other, n_tvt + n_other + n_static))
+
+            preds_step = []
+            trues_step = []
+            
+            # recursive steps: predict step-by-step, updating windows with preds
+            for step in range(0, feature_window_size + 1):
+                start = step
+                end = start + feature_window_size  # exclusive end for slicing past lags; current index = end
+
+                # flattened lagged time-varying features for all windows at this step
+                tv_block = windows[:, start:end, :][:, :, idx_tvd].reshape(n_windows, -1)
+
+                # current-day non-target and static features (at index 'end')
+                other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
+                static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
+
+                X_batch = np.concatenate([tv_block, other_feats, static_feats], axis=1)
+
+                # one predict call for all windows at this step
+                if tensor:
+                    y_batch = model.predict(X_batch, batch_size=batch_size).reshape(-1)
+                else: 
+                    y_batch = model.predict(X_batch).reshape(-1)
+                
+                
+                # label index inside window to read true or overwrite with prediction
+                label_start = step + feature_window_size + shift - 1
+                label_end = label_start + label_window_size
+
+                preds_step.append(y_batch.copy())
+                true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1)
+                trues_step.append(true_labels.copy())
+            
+                if step == feature_window_size:
+                    # final step: collect predictions and true labels
+                    true_labels = windows[:, label_start:label_end, idx_twd_in_tvt].reshape(-1)
+                    preds_all.append(y_batch.copy())
+                    trues_all.append(true_labels.copy())
+                else:
+                    # update the 'twd' position for all windows with predicted values (autoregressive feed)
+                    windows[:, label_start, idx_twd_in_tvt] = y_batch
+
+            preds_rollout_all.append(np.array(preds_step))
+            trues_rollout_all.append(np.array(trues_step))
+
+            
+    if len(preds_all) == 0:
+        return np.array([]), np.array([])
+
+    preds = np.concatenate(preds_all, axis=0)
+    trues = np.concatenate(trues_all, axis=0)
+    return preds, trues, np.array(preds_rollout_all), np.array(trues_rollout_all)
 
 
 def compute_recursive_predictions_fast_torch(
@@ -1618,6 +1729,59 @@ def build_ds_from_get_dataset_LSTM(df_split, feature_window_size, config,
 
 # train model with cv datasets, and calculate average performance
 # create function to streamline cv for other models later
+
+
+
+#####=================CV functions=======================#######
+# create cross validation training function for ridge regression
+
+def cross_validation_ridge(cv_train_val_ds_at, train_val_datasets_at, lag_n, config,
+                          if_log = False):
+    rmses_cv_at = []
+    rmses_cv_1d_at = []
+    r2s_cv_1d_at = []
+    r2s_cv_at = []
+    y_preds_cv_at = []
+    y_trues_cv_at = []
+    for i, (train_cv_X_at, train_cv_y_at, val_cv_X_at, val_cv_y_at) in enumerate(cv_train_val_ds_at):
+        print(f"Training fold {i+1}/{len(cv_train_val_ds_at)}")
+        
+        # Train the model
+        model_fold_cv = RidgeCV(alphas=[1e-3, 1e-2, 1e-1, 1, 2, 5]).fit(train_cv_X_at, train_cv_y_at)
+    
+        # Evaluate on validation set
+        val_pred_1day_at = model_fold_cv.predict(val_cv_X_at)
+
+        val_cv_df_at = train_val_datasets_at[i][1]
+        val_pred_recursive_at, val_true_recursive_at  = compute_recursive_predictions_fast(
+            model_fold_cv,
+            val_cv_df_at,
+            feature_window_size=lag_n,
+            shift=1,
+            config=config,
+            tensor = False)
+
+        if if_log:
+            val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_true_recursive_at = np.power(2, val_true_recursive_at) - 1
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_1day_at)
+            val_cv_y_at = np.power(2, val_cv_y_at)-1
+        
+        val_rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        val_rmse_1day_at = root_mean_squared_error(val_cv_y_at, val_pred_1day_at)
+        r2_1day_at = r2_score(val_cv_y_at, val_pred_1day_at)
+        r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+        
+        
+        rmses_cv_at.append(val_rmse_recursive_at)
+        rmses_cv_1d_at.append(val_rmse_1day_at)
+        r2s_cv_1d_at.append(r2_1day_at)
+        
+        r2s_cv_at.append(r2_recursive_at)
+        y_preds_cv_at.append(val_pred_recursive_at)
+        y_trues_cv_at.append(val_true_recursive_at)
+    
+    return rmses_cv_at, rmses_cv_1d_at, r2s_cv_1d_at, r2s_cv_at, y_preds_cv_at, y_trues_cv_at
 
 
 
