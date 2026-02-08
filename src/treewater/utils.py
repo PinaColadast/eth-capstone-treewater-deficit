@@ -710,41 +710,9 @@ def compute_recursive_predictions_fast_LSTM(
                 other_feats = windows[:, end, :][:, idx_other] if n_other > 0 else np.empty((n_windows, 0))
                 static_feats = windows[:, end, :][:, idx_static] if n_static > 0 else np.empty((n_windows, 0))
 
-                # predict in batch using a PyTorch model
-                # tv_block: (n_windows, feature_window_size, n_tvt)
-                # other_feats: (n_windows, n_other)
-                # static_feats: (n_windows, n_static)
-                # We'll run inference in chunks to avoid OOM and support device placement.
-                # Determine device from model params if possible, otherwise use CUDA if available.
-                try:
-                    dev = next(model.parameters()).device
-                except StopIteration:
-                    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-                was_training = model.training
-                model.eval()
-                y_preds_chunks = []
-                with torch.no_grad():
-                    n_all = tv_block.shape[0]
-                    for s in range(0, n_all, batch_size):
-                        e = min(s + batch_size, n_all)
-                        tv_b = torch.from_numpy(tv_block[s:e]).float().to(dev)
-                        other_b = torch.from_numpy(other_feats[s:e]).float().to(dev) if n_other > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
-                        static_b = torch.from_numpy(static_feats[s:e]).float().to(dev) if n_static > 0 else torch.empty((e-s, 0), dtype=torch.float32, device=dev)
-                        try:
-                            out = model(tv_b, other_b, static_b)
-                        except TypeError:
-                            out = model([tv_b, other_b, static_b])
-                        out = out.reshape(-1).cpu().numpy()
-                        y_preds_chunks.append(out)
-
-                if was_training:
-                    model.train()
-
-                if len(y_preds_chunks) > 0:
-                    y_batch = np.concatenate(y_preds_chunks, axis=0)
-                else:
-                    y_batch = np.array([])
+                # predict in batch using LSTM model inputs
+                y_batch = model.predict([tv_block, other_feats, static_feats], batch_size=batch_size,
+                                         verbose=0).reshape(-1)
 
                 # label indices
                 label_start = step + feature_window_size + shift - 1
@@ -757,10 +725,6 @@ def compute_recursive_predictions_fast_LSTM(
                 else:
                     # update autoregressive twd in all windows for next step
                     windows[:, label_start, idx_twd_in_tvt] = y_batch
-
-    # Restore training state
-    if was_training:
-        model.train()
 
     if len(preds_all) == 0:
         return np.array([]), np.array([])
@@ -1834,7 +1798,7 @@ def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at,
         if if_log:
             val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
             val_true_recursive_at = np.power(2, val_true_recursive_at)-1
-            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_1day_at)
             val_y_cv_1d_at = np.power(2, val_y_cv_1d_at)-1
 
         
@@ -1992,7 +1956,7 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
         if if_log:
             val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
             val_true_recursive_at = np.power(2, val_true_recursive_at)-1
-            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_1day_at)
             val_y_cv_1d_at = np.power(2, val_y_cv_1d_at)-1
         
         rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
@@ -2085,7 +2049,7 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
         if if_log:
             val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
             val_true_recursive_at = np.power(2, val_true_recursive_at)-1
-            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_1day_at)
             val_y_cv_1d_at = np.power(2, val_y_cv_1d_at)-1
         
         rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
