@@ -1786,7 +1786,8 @@ def cross_validation_ridge(cv_train_val_ds_at, train_val_datasets_at, lag_n, con
 
 
 def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at, lag_n, config, batch_size,
-                          num_epochs=40):
+                          num_epochs=50,
+                          if_log = False):
     maes_cv_at = []
     rmses_cv_at = []
     rmses_cv_1d_at = []
@@ -1829,10 +1830,20 @@ def cross_validation_LSTM(model_fold, cv_train_val_ds_at, train_val_datasets_at,
             shift=1,
             config=config,
             batch_size=batch_size)
+
+        if if_log:
+            val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_true_recursive_at = np.power(2, val_true_recursive_at)-1
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_y_cv_1d_at = np.power(2, val_y_cv_1d_at)-1
+
         
         rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_pred_1day_at)
+
         r2_1day_at = r2_score(val_y_cv_1d_at, val_pred_1day_at)
         r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
+        
         
         
         maes_cv_at.append(val_mae_1day_at)
@@ -1910,7 +1921,7 @@ def cross_validation_LSTM_Horizon(model_fold, cv_train_val_ds_at, train_val_data
 
 def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, batch_size,
                             label_window_size = 1,
-                             num_epochs=40):
+                             num_epochs=50, if_log = False):
     maes_cv_at = []
     rmses_cv_at = []
     rmses_cv_1d_at = []
@@ -1977,8 +1988,15 @@ def cross_validation_LSTM_FT(model_fold, train_val_datasets_at, lag_n, config, b
             shift=1,
             config=config,
             batch_size=batch_size)
+
+        if if_log:
+            val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_true_recursive_at = np.power(2, val_true_recursive_at)-1
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_y_cv_1d_at = np.power(2, val_y_cv_1d_at)-1
         
         rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_pred_1day_at)
         r2_1day_at = r2_score(val_y_cv_1d_at, val_pred_1day_at)
         r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
         
@@ -2001,7 +2019,8 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
                              num_epochs=40,
                              p_min = 0.1, warmup_epochs = 3, frac_decay = 0.8,
                              label_window_size = 1,
-                             slow_decay = True):
+                             slow_decay = True,
+                             if_log = True):
     
     maes_cv_at = []
     rmses_cv_at = []
@@ -2062,8 +2081,15 @@ def cross_validation_LSTM_AR(model_fold, train_val_datasets_at, lag_n, config, b
             shift=1,
             config=config,
             batch_size=batch_size)
+
+        if if_log:
+            val_pred_recursive_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_true_recursive_at = np.power(2, val_true_recursive_at)-1
+            val_pred_1day_at = clip_and_inverse_log2_transform(val_pred_recursive_at)
+            val_y_cv_1d_at = np.power(2, val_y_cv_1d_at)-1
         
         rmse_recursive_at = root_mean_squared_error(val_true_recursive_at,val_pred_recursive_at)
+        val_rmse_1day_at = root_mean_squared_error(val_y_cv_1d_at, val_pred_1day_at)
         r2_1day_at = r2_score(val_y_cv_1d_at, val_pred_1day_at)
         r2_recursive_at = r2_score(val_true_recursive_at, val_pred_recursive_at)
         
