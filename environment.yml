@@ -201,6 +201,7 @@ dependencies:
   - zipp=3.23.0
   - zlib-ng=2.3.2
   - zstd=1.5.7
+  - scikit-learn
   - pip:
       - absl-py==2.3.1
       # CUDA toolchain (brings ptxas + libdevice)
